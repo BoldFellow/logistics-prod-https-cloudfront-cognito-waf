@@ -1,0 +1,1088 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::SecretsManager-2020-07-23
+Description: >
+  Logistics-Prod Backend Stack — Cognito + Secrets Manager (rotation) +
+  RDS PostgreSQL Multi-AZ + ALB (HTTP:80 forward + optional HTTPS:443) +
+  ASG + S3 media bucket + CloudWatch alarms.
+  Subnets imported from VpcStackName/VpcName exports (same VPC as Logistics).
+  Deploy this stack first.  Then deploy 02-edge.yaml (always in us-east-1).
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+
+  # ---- Cross-stack networking (reuse from existing Logistics VPC) -----------
+  VpcStackName:
+    Type: String
+    Description: Name of the VPC CloudFormation stack to import subnet/VPC IDs from.
+
+  VpcName:
+    Type: String
+    Default: VPC1
+    Description: VPC name within the VPC stack (Vpc1Name or Vpc2Name).
+
+  BastionSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: SG of the bastion host — granted RDS:5432 ingress for schema bootstrap.
+
+  # ---- Application artifact -------------------------------------------------
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket containing the zipped Flask app.
+
+  ArtifactKey:
+    Type: String
+    Default: logistics-prod/app.zip
+    Description: S3 key of app.zip (must contain app.py + requirements.txt at the root).
+
+  # ---- Compute --------------------------------------------------------------
+  AppInstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium, t4g.large, m6g.large, m6g.xlarge]
+    Description: EC2 instance type for ASG members (ARM64 Graviton).
+
+  AsgMinSize:
+    Type: Number
+    Default: 2
+
+  AsgMaxSize:
+    Type: Number
+    Default: 4
+
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 2
+
+  # ---- Database -------------------------------------------------------------
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium, db.t4g.large]
+    Description: >
+      Note: db.t4g.micro does not support Multi-AZ.
+      Use db.t4g.small or larger for this stack.
+
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+
+  DbSecretName:
+    Type: String
+    Default: rds/logistics-prod
+    Description: Secrets Manager secret name for RDS credentials.
+
+  # ---- Cognito --------------------------------------------------------------
+  CognitoDomainPrefix:
+    Type: String
+    AllowedPattern: '[a-z0-9-]+'
+    Description: >
+      Prefix for the Cognito Hosted UI domain (must be globally unique).
+      Full domain becomes: <prefix>-<AccountId>.auth.<Region>.amazoncognito.com
+      Example: logistics-prod-auth
+
+  AdminInitialEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Email address for the first Admin user.
+      Cognito sends a temporary password; user sets a permanent one on first login.
+      Leave empty to create users manually in the Cognito console.
+
+  # ---- HTTPS (optional) -----------------------------------------------------
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Your custom domain (e.g. logistics.example.com).
+      If provided, an ACM certificate is created for this domain and attached
+      to the ALB HTTPS:443 listener. DNS validation — you must add the CNAME
+      record to your DNS provider before the stack can complete.
+      Leave empty to skip HTTPS on the ALB (CloudFront still enforces HTTPS
+      for public users via its viewer protocol policy).
+
+  # ---- VPC endpoint toggles (set to false if another stack already owns them)
+  CreateS3GatewayEndpoint:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  CreateInterfaceEndpoints:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "VPC (cross-stack import)" }
+        Parameters: [VpcStackName, VpcName, BastionSecurityGroupId]
+      - Label: { default: "Application artifact" }
+        Parameters: [ArtifactBucket, ArtifactKey]
+      - Label: { default: "Compute" }
+        Parameters: [AppInstanceType, AsgMinSize, AsgMaxSize, AsgDesiredCapacity]
+      - Label: { default: "Database" }
+        Parameters: [DbInstanceClass, DbAllocatedStorage, DbSecretName]
+      - Label: { default: "Cognito" }
+        Parameters: [CognitoDomainPrefix, AdminInitialEmail]
+      - Label: { default: "HTTPS (optional)" }
+        Parameters: [DomainName]
+      - Label: { default: "VPC endpoint toggles" }
+        Parameters: [CreateS3GatewayEndpoint, CreateInterfaceEndpoints]
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  HasCustomDomain:         !Not [!Equals [!Ref DomainName, ""]]
+  CreateInitialAdminUser:  !Not [!Equals [!Ref AdminInitialEmail, ""]]
+  ShouldCreateS3Endpoint:  !Equals [!Ref CreateS3GatewayEndpoint, "true"]
+  ShouldCreateInterfaceEndpoints: !Equals [!Ref CreateInterfaceEndpoints, "true"]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Cognito User Pool
+  #
+  # Teaching points:
+  #   * Cognito is the source of truth for identity (no users table in the DB).
+  #   * Hosted UI handles login / MFA / password reset — zero auth UI to build.
+  #   * id_token is a signed JWT. Flask validates it using the Cognito JWKS
+  #     endpoint (public keys). No Cognito API call needed per request.
+  #   * Groups (Admins / Drivers) are embedded in the id_token as
+  #     cognito:groups: ["Admins"]. The app reads them from the JWT claims.
+  # ---------------------------------------------------------------------------
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      # Append AccountId so the prefix is globally unique without extra input.
+      Domain: !Sub "${CognitoDomainPrefix}-${AWS::AccountId}"
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub "${AWS::StackName}-web-client"
+      GenerateSecret: false  # Public client — safe because token exchange is server-side
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code               # Authorization Code flow (most secure for web apps)
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+      # Callback URLs -- update these after you know your CloudFront domain.
+      # You can add both the *.cloudfront.net URL and your custom domain.
+      # The app reads APP_URL from its environment; the callback is APP_URL/auth/callback.
+      CallbackURLs:
+        - !Sub "https://placeholder.cloudfront.net/auth/callback"
+      LogoutURLs:
+        - !Sub "https://placeholder.cloudfront.net/"
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  CognitoAdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admins
+      Description: Full access to Flask-Admin GUI and all driver routes
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoDriversGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Drivers
+      Description: Access to driver photo upload routes only
+      UserPoolId: !Ref CognitoUserPool
+
+  # Optional: create the first admin user (Cognito emails a temporary password).
+  CognitoInitialAdminUser:
+    Condition: CreateInitialAdminUser
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Username: !Ref AdminInitialEmail
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminInitialEmail
+        - Name: email_verified
+          Value: "true"
+      DesiredDeliveryMediums:
+        - EMAIL
+
+  CognitoInitialAdminAttachment:
+    Condition: CreateInitialAdminUser
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    DependsOn: CognitoInitialAdminUser
+    Properties:
+      GroupName: Admins
+      Username: !Ref AdminInitialEmail
+      UserPoolId: !Ref CognitoUserPool
+
+  # ---------------------------------------------------------------------------
+  # ACM Certificate (app region, for ALB HTTPS:443)
+  #
+  # Teaching note: CloudFront requires its certificate in us-east-1.
+  # This certificate is DIFFERENT — it's for the ALB in whatever region you
+  # chose for this stack (may also be us-east-1, or another region).
+  # Having two separate certs makes the regional constraint visible.
+  # ---------------------------------------------------------------------------
+  AlbCertificate:
+    Condition: HasCustomDomain
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-cert"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager — DB credentials with automatic rotation
+  #
+  # Teaching points:
+  #   * The secret is pre-created with username/engine/dbname/port.
+  #   * SecretTargetAttachment patches the host/port in after RDS exists.
+  #   * RotationSchedule uses HostedRotationLambda — CloudFormation deploys
+  #     the rotation Lambda automatically (no SAM transform needed).
+  #   * The Lambda runs inside the VPC so it can reach RDS:5432 directly.
+  #   * After each rotation, app.py reads the NEW credentials from Secrets
+  #     Manager at startup. Rotation triggers a rolling instance refresh.
+  # ---------------------------------------------------------------------------
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Ref DbSecretName
+      Description: RDS PostgreSQL credentials for Logistics-Prod.
+      GenerateSecretString:
+        SecretStringTemplate: >
+          {"username":"appadmin","engine":"postgres","dbname":"logistics","port":5432}
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-secret"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  DBSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref DBInstance
+      TargetType: AWS::RDS::DBInstance
+
+  DBSecretRotation:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: DBSecretAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      HostedRotationLambda:
+        RotationType: PostgreSQLSingleUser
+        RotationLambdaName: !Sub "${AWS::StackName}-secret-rotation"
+        VpcSecurityGroupIds: !Ref AppSecurityGroup
+        VpcSubnetIds: !Join
+          - ","
+          - - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
+            - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+      RotationRules:
+        AutomaticallyAfterDays: 30
+
+  # ---------------------------------------------------------------------------
+  # S3 Media Bucket
+  #
+  # Stores proof-of-delivery photos uploaded by drivers.
+  # All public access is blocked — only CloudFront can read via OAC.
+  # App instances write via IAM instance role (AppInstanceRole below).
+  # ---------------------------------------------------------------------------
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-media-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:       true
+        IgnorePublicAcls:      true
+        BlockPublicPolicy:     true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-media"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP:80 (CloudFront) and HTTPS:443 (direct access)
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from CloudFront and internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for direct access
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App EC2 instances - only ALB can reach port 80
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app-sg"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  AppFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: HTTP from ALB
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL - app tier + bastion + rotation Lambda
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rds-sg"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  RdsFromAppIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+      Description: Postgres from app tier and rotation Lambda (both use AppSecurityGroup)
+
+  RdsFromBastionIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref BastionSecurityGroupId
+      Description: Postgres from bastion for schema bootstrap
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateInterfaceEndpoints
+    Properties:
+      GroupDescription: HTTPS from app instances to interface endpoints
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: HTTPS from app tier
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-endpoint-sg"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # VPC Endpoints (S3 Gateway + Secrets Manager + SSM)
+  # ---------------------------------------------------------------------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateS3Endpoint
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateRouteTableId"
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateInterfaceEndpoints
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateInterfaceEndpoints
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateInterfaceEndpoints
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateInterfaceEndpoints
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # NAT Gateway (single-AZ, public subnet A)
+  # ---------------------------------------------------------------------------
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-eip"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PublicSubnetAId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-gw"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateRouteTableId"
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ---------------------------------------------------------------------------
+  # RDS PostgreSQL — Multi-AZ, 7-day backups, encrypted
+  #
+  # Teaching point vs. original Logistics:
+  #   * MultiAZ: true  — standby replica in a second AZ.
+  #     RDS automatically fails over in ~15–60s if the primary becomes
+  #     unavailable. The endpoint DNS name is updated automatically.
+  #   * BackupRetentionPeriod: 7 — keep 7 days of automated backups.
+  #     Original Logistics kept only 1.
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${AWS::StackName}-db-subnet-group"
+      DBSubnetGroupDescription: DB subnets for Logistics-Prod RDS.
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-DbSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-DbSubnetBId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-subnet-group"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-pg"
+      Engine: postgres
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: logistics
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecret}::username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}::password}}'
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      MultiAZ: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-pg"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # IAM — EC2 instance role
+  # ---------------------------------------------------------------------------
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-app-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: logistics-prod-app-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read DB credentials from Secrets Manager
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Ref DBSecret
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DbSecretName}*"
+              # Read app artifact from S3
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactKey}"
+              # Write proof-of-delivery photos to the media bucket.
+              # Key prefix must be media/shipments/* to match the CloudFront /media/* → S3 path.
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${MediaBucket.Arn}/media/*"
+              # Invalidate CloudFront cache after driver photo upload
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app-role"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-app-profile"
+      Roles: [!Ref AppInstanceRole]
+
+  # ---------------------------------------------------------------------------
+  # Application Load Balancer
+  #
+  # HTTP:80  — forwarding to target group.
+  #            CloudFront uses this as the ALB origin (HTTP:80).
+  # HTTPS:443 — forwarding to target group (only created if DomainName is set).
+  #             Useful for direct admin access.
+  #
+  # Teaching note on CloudFront → ALB protocol:
+  #   CloudFront uses HTTP:80 to communicate with the ALB.
+  #   All public user traffic arrives at CloudFront over HTTPS (enforced by
+  #   the viewer protocol policy in 02-edge.yaml). The CloudFront → ALB
+  #   leg stays within AWS network infrastructure.
+  #   In production with a custom origin domain + matching cert, you would
+  #   configure OriginProtocolPolicy: https-only in the CloudFront distribution.
+  # ---------------------------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PublicSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PublicSubnetBId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      VpcId:
+        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-tg"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # HTTP:80 forwarding listener — used by CloudFront as the ALB origin.
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # HTTPS:443 listener — only created when DomainName (and cert) is provided.
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCustomDomain
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref AlbCertificate
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # Launch Template + Auto Scaling Group
+  #
+  # New environment variables vs. original Logistics userdata:
+  #   COGNITO_USER_POOL_ID -- for JWKS URL construction in app.py
+  #   COGNITO_CLIENT_ID    -- for JWT audience validation
+  #   COGNITO_DOMAIN       -- for Hosted UI login/token URLs
+  #   S3_MEDIA_BUCKET      -- for boto3 put_object in driver_photo_upload
+  #   APP_URL              -- for OAuth callback URL (update after CloudFront deploy)
+  # ---------------------------------------------------------------------------
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-lt"
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile:
+          Name: !Ref AppInstanceProfile
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${AWS::StackName}-instance"
+              - Key: ManagedByCloudFormation
+                Value: "true"
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+              REGION="${AWS::Region}"
+              S3_BUCKET="${ArtifactBucket}"
+              APP_KEY="${ArtifactKey}"
+              SECRET_NAME="${DbSecretName}"
+              APP_DIR="/opt/app"
+              COGNITO_POOL_ID="${CognitoUserPool}"
+              COGNITO_CLIENT="${CognitoUserPoolClient}"
+              MEDIA_BUCKET="${MediaBucket}"
+
+              # ---- 1. Base packages ----
+              dnf update -y
+              dnf install -y python3.11 python3.11-pip nginx unzip awscli-2 postgresql15
+
+              # ---- 2. Fetch app bundle from S3 ----
+              mkdir -p "${!APP_DIR}"
+              aws s3 cp "s3://${!S3_BUCKET}/${!APP_KEY}" /tmp/app.zip --region "${!REGION}"
+              unzip -o /tmp/app.zip -d "${!APP_DIR}"
+              rm -f /tmp/app.zip
+
+              # ---- 3. Python venv + dependencies ----
+              python3.11 -m venv "${!APP_DIR}/venv"
+              "${!APP_DIR}/venv/bin/pip" install --upgrade pip
+              "${!APP_DIR}/venv/bin/pip" install -r "${!APP_DIR}/requirements.txt"
+              chown -R ec2-user:ec2-user "${!APP_DIR}"
+
+              # ---- 4. Build the Cognito Hosted UI FQDN ----
+              # Format: <prefix>-<accountId>.auth.<region>.amazoncognito.com
+              COGNITO_HOSTED_DOMAIN="${CognitoDomainPrefix}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+
+              # ---- 5. Flask secret key (random per instance, rotate on ASG refresh) ----
+              FLASK_KEY="$(openssl rand -hex 32)"
+
+              # APP_URL is set to a placeholder here.
+              # UPDATE THIS after you have your CloudFront domain:
+              #   aws cloudformation update-stack --stack-name <backend-stack> \
+              #     --use-previous-template \
+              #     --parameters ParameterKey=AppUrl,ParameterValue=https://<dist>.cloudfront.net \
+              #     ... (or trigger an instance refresh to pick up the new env var)
+              APP_URL_VALUE="${DomainName}"
+
+              # ---- 6. systemd unit for gunicorn ----
+              cat > /etc/systemd/system/flask-admin.service << UNIT_EOF
+              [Unit]
+              Description=Logistics-Prod Flask App
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=simple
+              User=ec2-user
+              Group=ec2-user
+              WorkingDirectory=${!APP_DIR}
+              Environment="DB_SECRET_NAME=${!SECRET_NAME}"
+              Environment="AWS_REGION=${!REGION}"
+              Environment="FLASK_SECRET_KEY=${!FLASK_KEY}"
+              Environment="COGNITO_USER_POOL_ID=${!COGNITO_POOL_ID}"
+              Environment="COGNITO_CLIENT_ID=${!COGNITO_CLIENT}"
+              Environment="COGNITO_DOMAIN=${!COGNITO_HOSTED_DOMAIN}"
+              Environment="S3_MEDIA_BUCKET=${!MEDIA_BUCKET}"
+              Environment="APP_URL=${!APP_URL_VALUE}"
+              ExecStart=${!APP_DIR}/venv/bin/gunicorn \
+                --workers 2 --bind 127.0.0.1:8000 \
+                --access-logfile - --error-logfile - \
+                --timeout 60 \
+                app:app
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT_EOF
+
+              # ---- 7. nginx reverse proxy ----
+              rm -f /etc/nginx/conf.d/default.conf
+              cat > /etc/nginx/conf.d/flask.conf << 'NGINX_EOF'
+              server {
+                  listen 80 default_server;
+                  server_name _;
+                  client_max_body_size 6M;
+
+                  location = /health {
+                      access_log off;
+                      proxy_pass http://127.0.0.1:8000/health;
+                  }
+
+                  location / {
+                      proxy_pass         http://127.0.0.1:8000;
+                      proxy_set_header   Host              $host;
+                      proxy_set_header   X-Real-IP         $remote_addr;
+                      proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                      proxy_set_header   X-Forwarded-Proto $scheme;
+                      proxy_read_timeout 60s;
+                  }
+              }
+              NGINX_EOF
+
+              # ---- 8. Start everything ----
+              systemctl daemon-reload
+              systemctl enable --now flask-admin
+              systemctl enable --now nginx
+
+              echo "user-data finished OK"
+            - DomainName: !If [HasCustomDomain, !Sub "https://${DomainName}", "https://UPDATE_ME_WITH_CLOUDFRONT_DOMAIN"]
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [DBSecretAttachment, HttpListener, PrivateDefaultRoute]
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
+        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-asg"
+          PropagateAtLaunch: true
+        - Key: ManagedByCloudFormation
+          Value: "true"
+          PropagateAtLaunch: true
+
+  # ---------------------------------------------------------------------------
+  # Scaling policies
+  # ---------------------------------------------------------------------------
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: 2
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      Cooldown: 120
+      ScalingAdjustment: -2
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ---------------------------------------------------------------------------
+  ScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-asg-cpu-high"
+      AlarmDescription: Scale out when average EC2 CPU > 40% for 1 min
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AppAutoScalingGroup
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 40
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref ScaleOutPolicy]
+
+  ScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-asg-cpu-low"
+      AlarmDescription: Scale in when average EC2 CPU < 20% for 2 min
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AppAutoScalingGroup
+      Statistic: Average
+      Period: 120
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref ScaleInPolicy]
+
+  # ALB 5xx alarm — catches app errors and upstream failures.
+  AlbHttp5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alb-5xx"
+      AlarmDescription: ALB 5xx responses > 50 in 1 min — investigate app or instances
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # RDS CPU alarm — high CPU can signal query inefficiency or connection storms.
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-cpu-high"
+      AlarmDescription: RDS CPU > 80% for 5 min — review slow queries or scale up
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+
+  # RDS storage alarm — triggers before the disk fills and the instance stalls.
+  RdsFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-low-storage"
+      AlarmDescription: RDS free storage < 2 GB — increase AllocatedStorage before it fills
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      # 2 GiB in bytes
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+
+  AlbDnsName:
+    Description: ALB DNS name (used as CloudFront ALB origin in 02-edge.yaml)
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-AlbDnsName"
+
+  AlbUrl:
+    Description: ALB direct URL (HTTP — for testing before CloudFront is set up)
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}/"
+    Export:
+      Name: !Sub "${AWS::StackName}-AlbUrl"
+
+  MediaBucketName:
+    Description: S3 media bucket name (imported by 02-edge.yaml for OAC bucket policy)
+    Value: !Ref MediaBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-MediaBucketName"
+
+  MediaBucketArn:
+    Description: S3 media bucket ARN
+    Value: !GetAtt MediaBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MediaBucketArn"
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-CognitoUserPoolId"
+
+  CognitoClientId:
+    Description: Cognito app client ID (no secret — public client)
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-CognitoClientId"
+
+  CognitoHostedUiDomain:
+    Description: Cognito Hosted UI domain FQDN
+    Value: !Sub "${CognitoDomainPrefix}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-CognitoHostedUiDomain"
+
+  DbEndpoint:
+    Description: RDS endpoint hostname
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DbEndpoint"
+
+  SecretArn:
+    Description: Secrets Manager secret ARN
+    Value: !Ref DBSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretArn"
+
+  AsgName:
+    Description: Auto Scaling Group name
+    Value: !Ref AppAutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AsgName"
+
+  NextStep:
+    Description: >
+      After stack reaches CREATE_COMPLETE:
+      1. Update the Cognito app client callback URLs with your CloudFront domain.
+      2. Deploy 02-edge.yaml.
+      3. Run schema bootstrap via SSM Run Command (see ssm-run-schema-from-artifact.sh).
+    Value: !Sub >
+      aws ssm send-command --region ${AWS::Region}
+      --document-name AWS-RunShellScript
+      --targets Key=tag:Name,Values=${AWS::StackName}-instance
+      --parameters commands=["cd /opt/app && psql -h ${DBInstance.Endpoint.Address}
+      -U appadmin -d logistics -f schema.sql"]

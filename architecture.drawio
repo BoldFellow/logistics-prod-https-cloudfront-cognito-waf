@@ -1,0 +1,330 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36">
+  <diagram id="logistics-prod-arch" name="Page-1">
+    <mxGraphModel dx="1521" dy="852" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             TITLE
+        ═══════════════════════════════════════════════════════════════ -->
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#232F3E;" value="Logistics-Prod — HTTPS + CloudFront + WAF + Cognito + RDS Multi-AZ Architecture" vertex="1">
+          <mxGeometry x="100" y="10" w="1400" h="36" as="geometry" />
+        </mxCell>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             ABOVE VPC — Internet / Route 53 / Cognito
+        ═══════════════════════════════════════════════════════════════ -->
+
+        <!-- Internet -->
+        <mxCell id="internet" parent="1" style="shape=mxgraph.aws4.internet_alt2;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;pointerEvents=1;" value="Internet" vertex="1">
+          <mxGeometry x="650" y="50" w="70" h="70" as="geometry" />
+        </mxCell>
+
+        <!-- Route 53 -->
+        <mxCell id="r53" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.route_53;html=1;fillColor=#8C4FFF;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;Route 53&lt;/b&gt;&lt;br&gt;logistics.ilyalevin.co.il&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;A-alias → CloudFront&lt;/font&gt;" vertex="1">
+          <mxGeometry x="450" y="50" w="70" h="70" as="geometry" />
+        </mxCell>
+
+        <!-- Cognito (managed service, outside VPC) -->
+        <mxCell id="cognito" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cognito;html=1;fillColor=#DD344C;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;Cognito User Pool&lt;/b&gt;&lt;br&gt;Hosted UI  ·  Auth Code Flow&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;Groups: Admins / Drivers&lt;br&gt;JWT validated via JWKS (no API call/req)&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1410" y="50" w="70" h="70" as="geometry" />
+        </mxCell>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             EDGE LAYER BOX — us-east-1 global services (Stack 02)
+        ═══════════════════════════════════════════════════════════════ -->
+        <mxCell id="edge_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f0ff;strokeColor=#6d3cc9;strokeWidth=2;dashed=1;fontSize=10;fontStyle=1;verticalAlign=top;spacingTop=6;align=left;spacingLeft=10;" value="Stack 02: Edge  —  us-east-1  (02-edge.yaml)" vertex="1">
+          <mxGeometry x="575" y="148" w="575" h="108" as="geometry" />
+        </mxCell>
+
+        <!-- CloudFront -->
+        <mxCell id="cf" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudfront;html=1;fillColor=#8C4FFF;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;CloudFront&lt;/b&gt;&lt;br&gt;2 origins: ALB + S3&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;HTTP/2+3  ·  Redirect-to-HTTPS&lt;br&gt;5 cache behaviors&lt;/font&gt;" vertex="1">
+          <mxGeometry x="635" y="167" w="70" h="70" as="geometry" />
+        </mxCell>
+
+        <!-- WAF -->
+        <mxCell id="waf" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.waf;html=1;fillColor=#DD344C;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;WAF Web ACL&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;① Common Rule Set&lt;br&gt;② IP Reputation List&lt;br&gt;③ Rate Limit 100/5 min&lt;/font&gt;" vertex="1">
+          <mxGeometry x="815" y="167" w="70" h="70" as="geometry" />
+        </mxCell>
+
+        <!-- ACM Certificate — us-east-1 for CloudFront -->
+        <mxCell id="acm_cf" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.certificate_manager;html=1;fillColor=#DD344C;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;ACM Cert  (us-east-1)&lt;/b&gt;&lt;br&gt;logistics.ilyalevin.co.il&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;CloudFront TLS  ·  DNS validated&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1005" y="167" w="70" h="70" as="geometry" />
+        </mxCell>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             VPC
+        ═══════════════════════════════════════════════════════════════ -->
+        <mxCell id="vpc" parent="1" style="shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_vpc;verticalLabelPosition=top;verticalAlign=bottom;align=left;whiteSpace=wrap;html=1;fillColor=#f0f8ff;strokeColor=#0066CC;strokeWidth=2;fontSize=13;fontStyle=1;spacingLeft=7;" value="VPC  —  Stack 01: Backend  (01-backend.yaml)" vertex="1">
+          <mxGeometry x="50" y="270" w="1510" h="840" as="geometry" />
+        </mxCell>
+
+        <!-- ─── PUBLIC SUBNETS ─── -->
+        <mxCell id="pub_sn" parent="1" style="shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_public_subnet;verticalLabelPosition=top;verticalAlign=bottom;align=left;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=1;fontSize=10;fontStyle=1;spacingLeft=7;opacity=80;" value="Public Subnets  (us-east-1a / us-east-1b)" vertex="1">
+          <mxGeometry x="70" y="285" w="970" h="125" as="geometry" />
+        </mxCell>
+
+        <!-- NAT Gateway -->
+        <mxCell id="nat" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.nat_gateway;html=1;fillColor=#8C4FFF;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;NAT Gateway&lt;/b&gt;" vertex="1">
+          <mxGeometry x="100" y="307" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- Bastion -->
+        <mxCell id="bastion" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.ec2;html=1;fillColor=#ED7100;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;Bastion&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;psql schema bootstrap&lt;br&gt;RDS SG ingress granted&lt;/font&gt;" vertex="1">
+          <mxGeometry x="290" y="307" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- ALB -->
+        <mxCell id="alb" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.application_load_balancer;html=1;fillColor=#8C4FFF;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;Application Load Balancer&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;HTTP:80 ← CloudFront (origin)&lt;br&gt;HTTPS:443 ← direct admin access&lt;/font&gt;" vertex="1">
+          <mxGeometry x="545" y="307" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- ACM Cert — app-region for ALB -->
+        <mxCell id="acm_alb" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.certificate_manager;html=1;fillColor=#DD344C;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;ACM Cert  (app-region)&lt;/b&gt;&lt;br&gt;logistics.ilyalevin.co.il&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;ALB HTTPS:443 listener&lt;/font&gt;" vertex="1">
+          <mxGeometry x="740" y="307" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- ─── PRIVATE APP SUBNETS ─── -->
+        <mxCell id="priv_app_sn" parent="1" style="shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_private_subnet;verticalLabelPosition=top;verticalAlign=bottom;align=left;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=1;fontSize=10;fontStyle=1;spacingLeft=7;opacity=80;" value="Private Subnets — App Tier  (us-east-1a / us-east-1b)" vertex="1">
+          <mxGeometry x="70" y="430" w="970" h="390" as="geometry" />
+        </mxCell>
+
+        <!-- Auto Scaling Group -->
+        <mxCell id="asg" parent="1" style="shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_auto_scaling_group;verticalLabelPosition=top;verticalAlign=bottom;align=left;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#FF8000;strokeWidth=2;fontSize=9;fontStyle=1;spacingLeft=7;" value="Auto Scaling Group  ·  min 2 / max 4 / desired 2  ·  scale +2 at CPU &gt; 40%  /  -2 at CPU &lt; 20%" vertex="1">
+          <mxGeometry x="90" y="455" w="510" h="195" as="geometry" />
+        </mxCell>
+
+        <!-- EC2 Instance A (us-east-1a) -->
+        <mxCell id="ec2a" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.ec2;html=1;fillColor=#ED7100;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;EC2  ·  t4g.small&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;nginx → gunicorn → Flask 3.1&lt;br&gt;Cognito JWT middleware&lt;/font&gt;" vertex="1">
+          <mxGeometry x="165" y="505" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- EC2 Instance B (us-east-1b) -->
+        <mxCell id="ec2b" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.ec2;html=1;fillColor=#ED7100;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;EC2  ·  t4g.small&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;nginx → gunicorn → Flask 3.1&lt;br&gt;Cognito JWT middleware&lt;/font&gt;" vertex="1">
+          <mxGeometry x="440" y="505" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- VPC Endpoints box -->
+        <mxCell id="vpce" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d0d0d0;fontSize=11;align=left;verticalAlign=top;spacingLeft=12;spacingTop=10;fontColor=#232F3E;" value="&lt;b&gt;VPC Endpoints&lt;/b&gt;&lt;br&gt;&lt;br&gt;▪ S3 Gateway  —  artifact download (dnf repos + app.zip)&lt;div&gt;▪ Secrets Manager Interface  —  GetSecretValue at app boot&lt;br&gt;▪ SSM Interface  —  Session Manager / Run Command&lt;br&gt;▪ SSMMessages Interface  —  SSM data channel&lt;br&gt;▪ EC2Messages Interface  —  SSM agent protocol&lt;/div&gt;" vertex="1">
+          <mxGeometry x="90" y="670" w="510" h="135" as="geometry" />
+        </mxCell>
+
+        <!-- ─── RIGHT COLUMN (inside VPC, outside subnet boxes) ─── -->
+
+        <!-- Secrets Manager -->
+        <mxCell id="sm" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.secrets_manager;html=1;fillColor=#DD344C;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;Secrets Manager&lt;/b&gt;&lt;br&gt;rds/logistics-prod&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;{username, password, host,&lt;br&gt;dbname, port, flask_secret_key}&lt;br&gt;Auto-rotation every 30 days&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1130" y="450" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- IAM Instance Role -->
+        <mxCell id="iam" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#DD344C;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.role;" value="&lt;b&gt;IAM Instance Role&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;AmazonSSMManagedInstanceCore&lt;br&gt;secretsmanager:GetSecretValue&lt;br&gt;s3:GetObject (artifact bucket)&lt;br&gt;s3:PutObject (media/*)&lt;br&gt;cloudfront:CreateInvalidation&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1130" y="640" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- S3 Media Bucket -->
+        <mxCell id="s3_media" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;html=1;fillColor=#7AA116;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;S3 Media Bucket&lt;/b&gt;&lt;br&gt;proof-of-delivery photos&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;All public access blocked&lt;br&gt;OAC (SigV4) → CloudFront only&lt;br&gt;Keys: media/shipments/&amp;lt;id&amp;gt;/&amp;lt;uuid&amp;gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1360" y="450" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- S3 Artifact Bucket -->
+        <mxCell id="s3_art" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;html=1;fillColor=#7AA116;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;S3 Artifact Bucket&lt;/b&gt;&lt;br&gt;h10-ilya&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;logistics-prod/app.zip&lt;br&gt;via S3 Gateway Endpoint&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1360" y="640" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- ─── DB SUBNETS ─── -->
+        <mxCell id="db_sn" parent="1" style="shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_private_subnet;verticalLabelPosition=top;verticalAlign=bottom;align=left;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=1;fontSize=10;fontStyle=1;spacingLeft=7;opacity=80;" value="DB Subnets  (us-east-1a / us-east-1b)  —  DB Route Table: local route only" vertex="1">
+          <mxGeometry x="70" y="840" w="1020" h="185" as="geometry" />
+        </mxCell>
+
+        <!-- RDS PostgreSQL Primary -->
+        <mxCell id="rds_p" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.rds;html=1;fillColor=#C925D1;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;RDS PostgreSQL  ·  PRIMARY&lt;/b&gt;&lt;br&gt;logistics-prod-backend-pg&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;db.t4g.small  ·  gp3 20 GiB  ·  Multi-AZ&lt;br&gt;Encrypted  ·  7-day backups  ·  :5432&lt;br&gt;DB: logistics  (customers · drivers · shipments)&lt;/font&gt;" vertex="1">
+          <mxGeometry x="350" y="870" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- RDS PostgreSQL Standby -->
+        <mxCell id="rds_s" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.rds;html=1;fillColor=#C925D1;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;RDS  ·  STANDBY&lt;/b&gt;&lt;br&gt;us-east-1b&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;Synchronous replication&lt;br&gt;Auto-failover ~15–60s&lt;br&gt;Endpoint DNS updated automatically&lt;/font&gt;" vertex="1">
+          <mxGeometry x="560" y="870" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- CloudWatch Alarms -->
+        <mxCell id="cw" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudwatch;html=1;fillColor=#E7157B;strokeColor=#ffffff;labelBackgroundColor=none;fontColor=#232F3E;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;align=center;aspect=fixed;" value="&lt;b&gt;CloudWatch Alarms&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px;&quot;&gt;ASG CPU high &gt; 40% / low &lt; 20%&lt;br&gt;ALB 5xx &gt; 50/min&lt;br&gt;RDS CPU &gt; 80%  ·  Storage &lt; 2 GiB&lt;/font&gt;" vertex="1">
+          <mxGeometry x="1130" y="870" w="60" h="60" as="geometry" />
+        </mxCell>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             EDGES — Traffic flows
+        ═══════════════════════════════════════════════════════════════ -->
+
+        <!-- Internet → CloudFront (user HTTPS traffic) -->
+        <mxCell id="e_inet_cf" edge="1" parent="1" source="internet" target="cf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#0080F0;fontSize=9;fontColor=#0080F0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="HTTPS">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Route 53 → CloudFront (DNS A-alias) -->
+        <mxCell id="e_r53_cf" edge="1" parent="1" source="r53" target="cf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1;strokeColor=#9673a6;dashed=1;fontSize=9;fontColor=#9673a6;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="A-alias">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- CloudFront → WAF (attached, same ACL) -->
+        <mxCell id="e_cf_waf" edge="1" parent="1" source="cf" target="waf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1;strokeColor=#DD344C;dashed=1;fontSize=9;fontColor=#DD344C;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="WAF attached">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ACM CF cert → CloudFront (TLS) -->
+        <mxCell id="e_acmcf_cf" edge="1" parent="1" source="acm_cf" target="cf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1;strokeColor=#b85450;dashed=1;fontSize=9;fontColor=#b85450;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" value="TLS cert">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Internet → Cognito (OAuth redirect for Hosted UI login) -->
+        <mxCell id="e_inet_cognito" edge="1" parent="1" source="internet" target="cognito" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1;strokeColor=#9673a6;dashed=1;fontSize=9;fontColor=#9673a6;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="OAuth redirect (Hosted UI login)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- CloudFront → ALB (HTTP:80, dynamic paths) -->
+        <mxCell id="e_cf_alb" edge="1" parent="1" source="cf" target="alb" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#0080F0;fontSize=9;fontColor=#0080F0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="HTTP:80  /admin/* /driver/* /track/* /*">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="670" y="270" />
+              <mxPoint x="575" y="270" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- CloudFront → S3 Media (OAC, /static/* /media/*) -->
+        <mxCell id="e_cf_s3media" edge="1" parent="1" source="cf" target="s3_media" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1;strokeColor=#82b366;dashed=1;fontSize=9;fontColor=#82b366;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="OAC (SigV4)  /static/* /media/*">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1390" y="202" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ACM ALB cert → ALB -->
+        <mxCell id="e_acmalb_alb" edge="1" parent="1" source="acm_alb" target="alb" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1;strokeColor=#b85450;dashed=1;fontSize=9;fontColor=#b85450;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" value="TLS cert">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- NAT GW → Internet (EC2 outbound: pip/dnf packages) -->
+        <mxCell id="e_nat_inet" edge="1" parent="1" source="nat" target="internet" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#0080F0;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=1;entryDx=0;entryDy=0;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="130" y="260" />
+              <mxPoint x="650" y="260" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- EC2 instances → NAT GW (outbound packages) -->
+        <mxCell id="e_ec2a_nat" edge="1" parent="1" source="ec2a" target="nat" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#666666;fontSize=9;fontColor=#666666;exitX=0;exitY=0.5;exitDx=0;exitDy=0;" value="pip / dnf">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="130" y="535" />
+              <mxPoint x="130" y="367" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ALB → ASG (HTTP:80 target group) -->
+        <mxCell id="e_alb_asg" edge="1" parent="1" source="alb" target="asg" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#0080F0;fontSize=9;fontColor=#0080F0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="HTTP :80">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- EC2 → Secrets Manager (GetSecretValue at boot) -->
+        <mxCell id="e_ec2_sm" edge="1" parent="1" source="ec2b" target="sm" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#b85450;fontSize=9;fontColor=#b85450;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="GetSecretValue">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1060" y="535" />
+              <mxPoint x="1060" y="480" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- EC2 → RDS Primary (TCP:5432) -->
+        <mxCell id="e_ec2_rds" edge="1" parent="1" source="asg" target="rds_p" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#6c8ebf;fontSize=9;fontColor=#6c8ebf;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="TCP :5432">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- EC2 → S3 Media (PutObject driver photos, via S3 GW endpoint) -->
+        <mxCell id="e_ec2_s3media" edge="1" parent="1" source="ec2b" target="s3_media" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#82b366;fontSize=9;fontColor=#82b366;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="s3:PutObject (media/*)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1060" y="535" />
+              <mxPoint x="1060" y="480" />
+              <mxPoint x="1250" y="480" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- EC2 → S3 Artifact (GetObject app.zip, via S3 GW endpoint) -->
+        <mxCell id="e_ec2_s3art" edge="1" parent="1" source="ec2a" target="s3_art" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#82b366;fontSize=9;fontColor=#82b366;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="s3:GetObject (app.zip)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1060" y="535" />
+              <mxPoint x="1060" y="670" />
+              <mxPoint x="1250" y="670" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- EC2 → Cognito (JWKS endpoint — JWT validation, outbound via NAT) -->
+        <mxCell id="e_ec2_cognito" edge="1" parent="1" source="ec2b" target="cognito" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#9673a6;fontSize=9;fontColor=#9673a6;exitX=1;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" value="JWKS (JWT validation)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1445" y="505" />
+              <mxPoint x="1445" y="120" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- EC2 → CloudFront CreateInvalidation (after driver photo upload) -->
+        <mxCell id="e_ec2_cf_inv" edge="1" parent="1" source="ec2b" target="cf" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#FF8000;fontSize=9;fontColor=#FF8000;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" value="CreateInvalidation (/track/*)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="470" y="420" />
+              <mxPoint x="670" y="420" />
+              <mxPoint x="670" y="237" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- IAM Role → EC2 (attached to instance profile) -->
+        <mxCell id="e_iam_ec2" edge="1" parent="1" source="iam" target="asg" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#DD344C;fontSize=9;fontColor=#DD344C;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.7;entryDx=0;entryDy=0;" value="instance profile">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1060" y="670" />
+              <mxPoint x="1060" y="584" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Bastion → RDS (psql schema bootstrap) -->
+        <mxCell id="e_bastion_rds" edge="1" parent="1" source="bastion" target="rds_p" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#9673a6;fontSize=9;fontColor=#9673a6;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="psql :5432  (schema bootstrap)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="320" y="425" />
+              <mxPoint x="380" y="425" />
+              <mxPoint x="380" y="870" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Secrets Manager rotation → RDS (HostedRotationLambda) -->
+        <mxCell id="e_sm_rds" edge="1" parent="1" source="sm" target="rds_p" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#b85450;fontSize=9;fontColor=#b85450;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" value="rotation Lambda (30d)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1160" y="930" />
+              <mxPoint x="410" y="930" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- RDS Primary ↔ Standby (synchronous replication) -->
+        <mxCell id="e_rds_pp_s" edge="1" parent="1" source="rds_p" target="rds_s" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#C925D1;strokeWidth=2;fontSize=9;fontColor=#C925D1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="sync replication">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
