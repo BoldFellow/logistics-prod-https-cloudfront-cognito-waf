@@ -28,15 +28,7 @@ RDS Multi-AZ PostgreSQL   +   S3 media bucket (private, OAC-only)
 Secrets Manager (rotation 30 days)  +  Cognito User Pool (Hosted UI)
 ```
 
-**Prerequisite:** A VPC from the existing Logistics project (or deploy
-`CF/VPC - Cidr + GetAz + OutPuts.yaml`). The VPC must have public, private, and
-DB subnet pairs.
-
-> **Note on `VpcStackName`:** The `01-backend.yaml` parameter `VpcStackName`
-> must match the actual CloudFormation stack name that exports the VPC
-> resources — not the VPC name itself. Check with:
-> `aws cloudformation list-exports --query 'Exports[?contains(Name,\`VPC\`)].Name'`
-> Common value: `VPCs` (not `VPC1`).
+**This project is self-contained** — `cfn/template.yaml` creates its own VPC, subnets, IGW, route tables, and NAT Gateway. No existing VPC or cross-stack dependencies required.
 
 **Optional:** A custom domain registered in Route 53 (or any registrar).
 If you don't have one, the app works fine on the `*.cloudfront.net` default URL.
@@ -47,334 +39,36 @@ If you don't have one, the app works fine on the `*.cloudfront.net` default URL.
 
 | # | Service | Resource | Notes |
 |---|---|---|---|
-| 0 | VPC / NAT | Prerequisites + NAT Gateway | VPC check, NAT gateway, app.zip upload |
-| 1 | S3 | Media bucket (private) | No bucket policy yet — applied in §10 once CloudFront ARN is known |
-| 2 | RDS | Multi-AZ PostgreSQL + DB subnet group | 7-day backups; master password typed manually |
-| 3 | Secrets Manager | RDS secret + `flask_secret_key` + rotation | Full config in one shot — RDS exists so instance can be selected and rotation enabled |
-| 4 | Cognito | User Pool + Hosted UI | Groups: Admins, Drivers — callback URL set in §10 after CloudFront domain is known |
-| 5 | ACM | Cert in **us-east-1** | For CloudFront — requested early so DNS validation runs in parallel |
-| 6 | ACM | Cert in **app region** | For ALB HTTPS:443 — skip if app region is us-east-1 |
-| 7 | EC2 | ALB + target group + HTTP/HTTPS listeners | CloudFront origin — target group can be empty at creation |
-| 8 | IAM | Instance role + instance profile | Needed by Launch Template in §11 |
-| 9 | WAF | Web ACL (CLOUDFRONT scope, us-east-1) | Attached when CloudFront is created in §10 |
-| 10 | CloudFront | Distribution + OAC + S3 bucket policy + Cognito callback | All final-URL wiring in one block |
-| 11 | EC2 | Launch Template + ASG | userdata uses real `APP_URL` from §10 — no instance refresh needed |
-| 12 | SSM | Schema bootstrap | Run schema.sql via Run Command once instances are healthy |
-| 13 | Route 53 | A-alias record | Optional — custom domain only |
-| 14 | — | End-to-end smoke test | Single pass through CloudFront |
+| 0 | — | Prerequisites | Upload app.zip to artifact bucket |
+| 1 | VPC | VPC + subnets + IGW + route tables + NAT | Self-contained network — 2 public, 2 app (private), 2 DB (isolated) |
+| 2 | S3 | Media bucket (private) | No bucket policy yet — applied in §11 once CloudFront ARN is known |
+| 3 | RDS | Multi-AZ PostgreSQL + DB subnet group | 7-day backups; master password typed manually |
+| 4 | Secrets Manager | RDS secret + `flask_secret_key` + rotation | Full config in one shot — RDS exists so instance can be selected and rotation enabled |
+| 5 | Cognito | User Pool + Hosted UI | Groups: Admins, Drivers — callback URL set in §11 after CloudFront domain is known |
+| 6 | ACM | Cert in **us-east-1** | For CloudFront — requested early so DNS validation runs in parallel |
+| 7 | ACM | Cert in **app region** | For ALB HTTPS:443 — skip if app region is us-east-1 |
+| 8 | EC2 | ALB + target group + HTTP/HTTPS listeners | CloudFront origin — target group can be empty at creation |
+| 9 | IAM | Instance role + instance profile | Needed by Launch Template in §13 |
+| 10 | WAF | Web ACL (CLOUDFRONT scope, us-east-1) | Attached when CloudFront is created in §12 |
+| 11 | CloudFront | Distribution + OAC + S3 bucket policy + Cognito callback | All final-URL wiring in one block |
+| 12 | EC2 | Launch Template + ASG | userdata uses real `APP_URL` from §11 — no instance refresh needed |
+| 13 | SSM | Schema bootstrap | Run schema.sql via Run Command once instances are healthy |
+| 14 | Route 53 | A-alias record | Optional — custom domain only |
+| 15 | — | End-to-end smoke test | Single pass through CloudFront |
 
 ---
 
-## CloudFormation Quick-Deploy Reference
-
-> **Read this section if you want to deploy the full stack with CLI commands instead of clicking through the console.**
-> The numbered sections (§0–§14) remain the learning reference — each step explains what the CFN resources do and why.
-
-### Why two stacks?
-
-CloudFront and WAF (`CLOUDFRONT` scope) require their resources in **`us-east-1`** regardless of which region the rest of your app runs in. ACM certificates used by CloudFront must also be in `us-east-1`. A single monolithic stack can only deploy to one region. The two-stack split makes this regional boundary explicit:
-
-| File | Stack name | Region | Contains |
-|---|---|---|---|
-| `CF/01-backend.yaml` | `logistics-prod-backend` | any region (e.g. `us-east-1`) | Cognito · Secrets Manager · RDS · S3 media bucket · ALB · ASG · IAM · ACM (app-region cert) |
-| `CF/02-edge.yaml` | `logistics-prod-edge` | **must be `us-east-1`** | ACM (CloudFront cert) · WAF · CloudFront · Route 53 record |
-
-`02-edge.yaml` imports outputs from `01-backend.yaml` via `Fn::ImportValue`, so **01-backend must reach `CREATE_COMPLETE` before you deploy 02-edge**.
-
 ---
 
-### Step 0 — Package and upload the app
-
-```bash
-cd "Logistics-Prod - HTTPS + CloudFront + Cognito + WAF"
-
-# Package the app (must preserve directory structure for templates/)
-zip -r app.zip app.py requirements.txt schema.sql templates/ static/
-
-# Upload to your artifact bucket
-aws s3 cp app.zip s3://YOUR_ARTIFACT_BUCKET/logistics-prod/app.zip --region us-east-1
-```
-
----
-
-### Step 1 — Deploy `01-backend.yaml`
-
-**Minimum required parameters** (everything else uses defaults):
-
-| Parameter | Description | Example |
-|---|---|---|
-| `VpcStackName` | CFN stack name that exports the VPC — check with `aws cloudformation list-exports` | `VPCs` |
-| `BastionSecurityGroupId` | SG allowed to reach RDS:5432 (for schema bootstrap via SSM) | `sg-0cf767078e8246971` |
-| `ArtifactBucket` | S3 bucket holding app.zip | `my-artifact-bucket` |
-| `CognitoDomainPrefix` | Prefix for Cognito Hosted UI — template appends `-{AccountId}` automatically; the full domain becomes `<prefix>-<AccountId>.auth.<Region>.amazoncognito.com` — **do not include your account ID in the prefix** | `logistics-prod-auth` |
-| `AdminInitialEmail` | Email for the first Admins-group user (optional — you can create manually) | `admin@example.com` |
-| `DomainName` | Custom domain for the app (optional — leave empty to use `*.cloudfront.net`) | `logistics.example.com` |
-
-> **Note:** There is no `CertificateArn` parameter. When `DomainName` is set, the template creates the ACM certificate itself (`AlbCertificate` resource, conditional on `HasCustomDomain`). DNS validation still requires you to add the CNAME to your DNS provider while the stack is creating — monitor ACM in the console and add it before the 30-minute timeout.
-
-```bash
-APP_REGION=us-east-1
-BACKEND_STACK=logistics-prod-backend
-
-aws cloudformation create-stack \
-  --stack-name "$BACKEND_STACK" \
-  --region "$APP_REGION" \
-  --template-body file://cfn/01-backend.yaml \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-  --parameters \
-    ParameterKey=VpcStackName,ParameterValue=VPCs \
-    ParameterKey=BastionSecurityGroupId,ParameterValue=sg-XXXXXXXXXXXXXXXXX \
-    ParameterKey=ArtifactBucket,ParameterValue=YOUR_ARTIFACT_BUCKET \
-    ParameterKey=CognitoDomainPrefix,ParameterValue=logistics-prod-auth \
-    ParameterKey=AdminInitialEmail,ParameterValue=admin@example.com \
-    ParameterKey=DomainName,ParameterValue=""
-
-# Wait for completion (takes ~15 min for RDS Multi-AZ)
-aws cloudformation wait stack-create-complete \
-  --stack-name "$BACKEND_STACK" --region "$APP_REGION"
-
-aws cloudformation describe-stacks \
-  --stack-name "$BACKEND_STACK" --region "$APP_REGION" \
-  --query "Stacks[0].StackStatus" --output text
-# Expect: CREATE_COMPLETE
-```
-
-> **⚠️ `CAPABILITY_AUTO_EXPAND` is required** — the template uses the `AWS::SecretsManager-2020-07-23` transform for Secrets Manager auto-rotation. Without it the deploy fails with `Requires capabilities: [CAPABILITY_AUTO_EXPAND]`.
-
----
-
-### Step 2 — Bootstrap the DB schema
-
-After `01-backend` is `CREATE_COMPLETE`, run `schema.sql` on the RDS instance via SSM (no bastion needed):
-
-```bash
-chmod +x ssm-run-schema-from-artifact.sh
-BACKEND_STACK=logistics-prod-backend APP_REGION=us-east-1 ./ssm-run-schema-from-artifact.sh
-```
-
----
-
-### Step 3 — Deploy `02-edge.yaml`
-
-**Must deploy in `us-east-1`** even if your app region is different.
-
-| Parameter | Description | Example |
-|---|---|---|
-| `BackendStackName` | Exact name of the backend stack (used for `Fn::ImportValue`) | `logistics-prod-backend` |
-| `DomainName` | Custom domain for CloudFront (optional — leave empty to use `*.cloudfront.net`) | `logistics.example.com` |
-| `HostedZoneId` | Route 53 hosted zone ID for the domain (required only if `DomainName` is set) | `Z1XXXXXXXXXX` |
-
-```bash
-EDGE_STACK=logistics-prod-edge
-
-aws cloudformation create-stack \
-  --stack-name "$EDGE_STACK" \
-  --region us-east-1 \
-  --template-body file://cfn/02-edge.yaml \
-  --capabilities CAPABILITY_IAM \
-  --parameters \
-    ParameterKey=BackendStackName,ParameterValue=logistics-prod-backend \
-    ParameterKey=DomainName,ParameterValue="" \
-    ParameterKey=HostedZoneId,ParameterValue=""
-
-# CloudFront distributions take 10–20 min to reach DEPLOYED
-aws cloudformation wait stack-create-complete \
-  --stack-name "$EDGE_STACK" --region us-east-1
-```
-
-> **Custom domain + ACM cert:** If `DomainName` is set, CFN creates an ACM cert and waits for DNS validation. You must manually add the CNAME record to your DNS provider before CFN can continue — check ACM → Certificates in the console and copy the CNAME. If the cert is stuck > 15 min, this is why.
-
----
-
-### Step 4 — Post-deploy wiring (required after 02-edge)
-
-Once `02-edge` completes, two manual steps are required because the CloudFront domain is only known after deployment:
-
-**4a — Get the CloudFront domain:**
-```bash
-CF_DOMAIN=$(aws cloudformation describe-stacks --stack-name logistics-prod-edge --region us-east-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='DistributionDomain'].OutputValue | [0]" --output text)
-echo "CloudFront domain: $CF_DOMAIN"
-# If using custom domain, use that instead: logistics.example.com
-```
-
-**4b — Update Cognito callback URLs** (console: Cognito → User pools → App clients → Edit):
-- Add `https://$CF_DOMAIN/auth/callback` to Allowed callback URLs
-- Add `https://$CF_DOMAIN/` to Allowed sign-out URLs
-
-Or via CLI:
-```bash
-POOL_ID=$(aws cognito-idp list-user-pools --max-results 50 --region us-east-1 \
-  --query "UserPools[?contains(Name,'logistics-prod')].Id | [0]" --output text)
-CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$POOL_ID" --region us-east-1 \
-  --query "UserPoolClients[0].ClientId" --output text)
-
-aws cognito-idp update-user-pool-client \
-  --user-pool-id "$POOL_ID" \
-  --client-id "$CLIENT_ID" \
-  --region us-east-1 \
-  --allowed-o-auth-flows-user-pool-client \
-  --allowed-o-auth-flows code \
-  --allowed-o-auth-scopes openid email profile \
-  --callback-urls "https://$CF_DOMAIN/auth/callback" \
-  --logout-urls "https://$CF_DOMAIN/"
-```
-
-**4c — Update `APP_URL` on EC2 instances** (so OAuth redirects use the right domain):
-```bash
-DIST_ID=$(aws cloudformation describe-stacks --stack-name logistics-prod-edge --region us-east-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='DistributionId'].OutputValue | [0]" --output text)
-
-cat > /tmp/ssm-update-env.json << EOF
-{
-  "DocumentName": "AWS-RunShellScript",
-  "InstanceIds": ["INSTANCE_ID_1", "INSTANCE_ID_2"],
-  "Parameters": {
-    "commands": [
-      "sed -i 's|APP_URL=.*|APP_URL=https://$CF_DOMAIN|' /etc/systemd/system/flask-admin.service",
-      "grep -q 'CF_DISTRIBUTION_ID' /etc/systemd/system/flask-admin.service || sed -i '/^\\[Service\\]/a Environment=CF_DISTRIBUTION_ID=$DIST_ID' /etc/systemd/system/flask-admin.service",
-      "systemctl daemon-reload && systemctl restart flask-admin"
-    ]
-  }
-}
-EOF
-aws ssm send-command --region us-east-1 --cli-input-json file:///tmp/ssm-update-env.json
-```
-
----
-
-### Step 5 — Validate the deployment
-
-```bash
-# Health check
-curl -s https://$CF_DOMAIN/health    # Expect: ok
-
-# HTTPS redirect
-curl -sI http://$CF_DOMAIN/ | grep -i location    # Expect: https://...
-
-# Tracking page cached by CloudFront
-curl -sI https://$CF_DOMAIN/track/TRK-100001 | grep x-cache  # 1st: Miss, 2nd: Hit
-
-# Admin redirects to Cognito
-curl -sI https://$CF_DOMAIN/admin/ | grep location   # Expect: cognito.../login?...
-
-# S3 direct access blocked
-MEDIA_BUCKET=$(aws cloudformation describe-stacks --stack-name logistics-prod-edge --region us-east-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='MediaBucketName'].OutputValue | [0]" --output text)
-curl -sI "https://$MEDIA_BUCKET.s3.us-east-1.amazonaws.com/test" | grep HTTP  # Expect: 403
-```
-
----
-
-### Updating the stack (re-deploy app code)
-
-```bash
-# 1. Repackage
-zip -r app.zip app.py requirements.txt schema.sql templates/ static/
-aws s3 cp app.zip s3://YOUR_ARTIFACT_BUCKET/logistics-prod/app.zip --region us-east-1
-
-# 2. Push to running instances via SSM
-cat > /tmp/ssm-deploy.json << 'EOF'
-{
-  "DocumentName": "AWS-RunShellScript",
-  "InstanceIds": ["INSTANCE_ID_1", "INSTANCE_ID_2"],
-  "Parameters": {
-    "commands": [
-      "cd /opt/app",
-      "aws s3 cp s3://YOUR_ARTIFACT_BUCKET/logistics-prod/app.zip /opt/app/app.zip --region us-east-1",
-      "unzip -o app.zip",
-      "/opt/app/venv/bin/pip install -q -r requirements.txt",
-      "systemctl restart flask-admin",
-      "sleep 3 && systemctl is-active flask-admin && echo OK"
-    ]
-  }
-}
-EOF
-COMMAND_ID=$(aws ssm send-command --region us-east-1 --cli-input-json file:///tmp/ssm-deploy.json \
-  --query "Command.CommandId" --output text)
-
-# 3. Check result
-aws ssm get-command-invocation --region us-east-1 \
-  --command-id "$COMMAND_ID" --instance-id INSTANCE_ID_1 \
-  --query "[Status,StandardOutputContent]" --output text
-```
-
----
-
-### Cleanup order (important — do CloudFront first)
-
-CloudFront distributions take ~15 min to disable. Start early.
-
-```bash
-# 1. Delete edge stack first (disables CloudFront, removes WAF, Route 53 record)
-aws cloudformation delete-stack --stack-name logistics-prod-edge --region us-east-1
-aws cloudformation wait stack-delete-complete --stack-name logistics-prod-edge --region us-east-1
-
-# 2. Empty the media bucket (required before CFN can delete it)
-MEDIA_BUCKET=$(aws s3api list-buckets \
-  --query "Buckets[?contains(Name,'logistics-prod-backend-media')].Name | [0]" --output text)
-aws s3 rm "s3://$MEDIA_BUCKET" --recursive
-
-# 3. Delete backend stack
-aws cloudformation delete-stack --stack-name logistics-prod-backend --region us-east-1
-aws cloudformation wait stack-delete-complete --stack-name logistics-prod-backend --region us-east-1
-```
+> **CloudFormation shortcut:** If you want to deploy the full stack with a single CLI command instead of clicking through the console, see [Appendix C](#appendix-c--deploy-via-cloudformation-shortcut) at the end of this guide.
 
 ---
 
 ## 0. Prerequisites
 
-### 0a. Confirm your VPC has DB subnets
+This project creates its own VPC and all networking resources (§1). The only prerequisite before you start clicking is uploading the app bundle.
 
-> **Console:** VPC → **Subnets** — filter by your VPC
-
-You need:
-- **2 public subnets** (ALB, NAT Gateway)
-- **2 private subnets** (ASG instances)
-- **2 DB subnets** (RDS — isolated, no internet route)
-
-If your VPC was created with the Logistics CloudFormation stack, the DB subnets
-already exist.  If not, follow the DB subnet instructions in §0 of the Logistics
-console guide before continuing.
-
-### 0b. NAT Gateway (required for private subnet instances)
-
-> **Console:** VPC → **NAT Gateways** → **Create NAT gateway**
->
-> **⚠️ This step is required when deploying via CLI.** The CloudFormation template
-> creates a NAT gateway automatically. If you skip it, instances in private subnets
-> cannot reach S3 (to download app.zip), Secrets Manager, SSM, or pip — user-data
-> will silently fail and the flask-admin service will never start.
-
-> **If your VPC stack already created a NAT gateway** (e.g., from a previous Logistics
-> deployment in the same VPC), skip this step — the route already exists.
-
-1. Name: `logistics-prod-nat`
-2. Subnet: any **public subnet** in your VPC
-3. Connectivity type: **Public**
-4. Elastic IP: click **Allocate Elastic IP**
-5. Click **Create NAT gateway** — wait ~1 minute for state to show **Available**
-6. Go to **Route Tables** → select the **private** route table for your VPC
-7. **Edit routes** → **Add route**:
-   - Destination: `0.0.0.0/0`
-   - Target: the NAT gateway you just created
-
-```bash
-# CLI equivalent:
-PUBLIC_SUBNET_ID=<your-public-subnet-id>
-EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --region us-east-1 \
-  --query 'AllocationId' --output text)
-NAT_GW_ID=$(aws ec2 create-nat-gateway \
-  --subnet-id "$PUBLIC_SUBNET_ID" --allocation-id "$EIP_ALLOC" \
-  --region us-east-1 --query 'NatGateway.NatGatewayId' --output text)
-aws ec2 wait nat-gateway-available --nat-gateway-ids "$NAT_GW_ID" --region us-east-1
-# Add default route to private route table
-PRIV_RT_ID=<your-private-route-table-id>
-aws ec2 create-route --route-table-id "$PRIV_RT_ID" \
-  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id "$NAT_GW_ID" --region us-east-1
-```
-
-### 0c. Upload the app zip to S3
+### 0a. Upload the app zip to S3
 
 The zip must preserve directory structure (`templates/` and `static/` as subdirs).
 
@@ -388,11 +82,95 @@ aws s3 cp app.zip s3://YOUR_ARTIFACT_BUCKET/logistics-prod/app.zip --region YOUR
 
 ---
 
-## 1. S3 Media Bucket
+## 1. VPC + Subnets + Internet Gateway + Route Tables
+
+> **Console:** VPC → **Your VPCs** → **Create VPC**
+
+**CloudFormation:** `Vpc`, `InternetGateway`, `VpcGatewayAttachment`, `PublicSubnetA/B`, `AppSubnetA/B`, `DbSubnetA/B`, `PublicRouteTable`, `PublicRoute`, `PrivateRouteTable`, subnet associations
+
+This project creates a dedicated VPC with three tiers per Availability Zone — public, app (private), and DB (isolated).
+
+### Step 1a — Create the VPC
+
+> VPC → **Your VPCs** → **Create VPC**
+
+1. Resources to create: **VPC only**
+2. Name tag: `logistics-prod-vpc`
+3. IPv4 CIDR block: `10.20.0.0/16`
+4. Tenancy: **Default**
+5. Click **Create VPC**
+6. Select the new VPC → **Actions** → **Edit VPC settings** → enable both:
+   - **DNS resolution** (EnableDnsSupport)
+   - **DNS hostnames** (EnableDnsHostnames)
+
+> Both DNS settings are required for VPC interface endpoints to resolve via private DNS.
+
+### Step 1b — Create the Internet Gateway
+
+> VPC → **Internet Gateways** → **Create internet gateway**
+
+1. Name tag: `logistics-prod-igw`
+2. Click **Create internet gateway**
+3. Select the new IGW → **Actions** → **Attach to VPC** → select `logistics-prod-vpc`
+
+### Step 1c — Create six subnets
+
+> VPC → **Subnets** → **Create subnet**
+
+Create all six subnets in `logistics-prod-vpc` (you can add all in one form using **Add new subnet**):
+
+| Name | AZ | CIDR | Tier |
+|---|---|---|---|
+| `logistics-prod-public-a` | AZ 1 (e.g. `us-east-1a`) | `10.20.0.0/24` | Public — NAT GW, ALB |
+| `logistics-prod-public-b` | AZ 2 (e.g. `us-east-1b`) | `10.20.1.0/24` | Public — ALB |
+| `logistics-prod-app-a` | AZ 1 | `10.20.10.0/24` | App (private) — EC2 |
+| `logistics-prod-app-b` | AZ 2 | `10.20.11.0/24` | App (private) — EC2 |
+| `logistics-prod-db-a` | AZ 1 | `10.20.20.0/24` | DB (isolated) — RDS primary |
+| `logistics-prod-db-b` | AZ 2 | `10.20.21.0/24` | DB (isolated) — RDS standby |
+
+After creating: select each **public** subnet → **Actions** → **Edit subnet settings** → check **Enable auto-assign public IPv4 address**. (Not needed for app or DB subnets.)
+
+### Step 1d — Public route table
+
+> VPC → **Route Tables** → **Create route table**
+
+1. Name: `logistics-prod-public-rt`, VPC: `logistics-prod-vpc` → **Create**
+2. Select it → **Routes** tab → **Edit routes** → **Add route**:
+   - Destination: `0.0.0.0/0`, Target: **Internet Gateway** → `logistics-prod-igw`
+3. **Subnet associations** tab → **Edit subnet associations** → select both `logistics-prod-public-a` and `logistics-prod-public-b`
+
+### Step 1e — Private route table
+
+> VPC → **Route Tables** → **Create route table**
+
+1. Name: `logistics-prod-private-rt`, VPC: `logistics-prod-vpc` → **Create**
+2. **Subnet associations** tab → select both `logistics-prod-app-a` and `logistics-prod-app-b`
+
+> DB subnets need no route table — they are fully isolated (local VPC routing only). The NAT Gateway default route is added to this table after you create the NAT Gateway in the next step.
+
+### Step 1f — NAT Gateway
+
+> VPC → **NAT Gateways** → **Create NAT gateway**
+
+1. Name: `logistics-prod-nat`
+2. Subnet: `logistics-prod-public-a`
+3. Connectivity type: **Public**
+4. Elastic IP: click **Allocate Elastic IP**
+5. Click **Create NAT gateway** — wait ~1 minute for state **Available**
+
+**Add the NAT route to the private route table:**
+- Route Tables → select `logistics-prod-private-rt` → **Routes** → **Edit routes** → **Add route**:
+  - Destination: `0.0.0.0/0`, Target: **NAT Gateway** → `logistics-prod-nat`
+
+> **Why single-AZ NAT?** A production setup uses one NAT Gateway per AZ. For this teaching demo, a single NAT in AZ 1 is sufficient — AZ-b instances route outbound through AZ-a.
+
+---
+
+## 2. S3 Media Bucket
 
 > **Console:** S3 → **Create bucket**
 
-**CloudFormation:** `MediaBucket` (in cfn/01-backend.yaml)
+**CloudFormation:** `MediaBucket` (in cfn/template.yaml)
 
 1. Bucket name: `logistics-prod-media-<YOUR_ACCOUNT_ID>` (must be globally unique)
 2. Region: same as your app region (can be any region — CloudFront will serve from all edges)
@@ -402,11 +180,11 @@ aws s3 cp app.zip s3://YOUR_ARTIFACT_BUCKET/logistics-prod/app.zip --region YOUR
 6. Click **Create bucket**
 
 > The bucket is empty now.  Drivers upload photos via the Flask app.
-> The bucket policy (allowing CloudFront via OAC) is applied in §10 once the
+> The bucket policy (allowing CloudFront via OAC) is applied in §11 once the
 > CloudFront distribution ARN is known.
 > Static assets (Flask-Admin CSS/JS) can be uploaded to `s3://bucket/static/`.
 
-### 1a — Optional: upload Flask-Admin static assets
+### 2a — Optional: upload Flask-Admin static assets
 
 Flask-Admin's bundled static files (Bootstrap 4 CSS/JS) are normally served
 from CDN.  Vendoring them into S3 means CloudFront can cache them with a 1-year
@@ -428,21 +206,21 @@ the EC2 instance (via the default ALB behavior). The vendoring step is optional.
 
 ---
 
-## 2. RDS PostgreSQL — Multi-AZ
+## 3. RDS PostgreSQL — Multi-AZ
 
 > **Console:** RDS → **Create database**
 
 **CloudFormation:** `DBSubnetGroup`, `DBInstance`
 
 > **Before starting:** Generate a strong master password now — you will enter it
-> into RDS in §2b and store the same value in Secrets Manager in §3.
+> into RDS in §3b and store the same value in Secrets Manager in §4.
 > ```bash
 > python3 -c "import secrets; print(secrets.token_hex(32))"
 > ```
 > Copy this value somewhere safe (e.g. a local scratch file). Do not lose it —
 > you will type it twice.
 
-### Step 2a — Create the DB subnet group
+### Step 3a — Create the DB subnet group
 
 > RDS → **Subnet groups** → **Create DB subnet group**
 
@@ -451,7 +229,7 @@ the EC2 instance (via the default ALB behavior). The vendoring step is optional.
 3. Add subnets: select both **DB subnets** (one per AZ)
 4. Click **Create**
 
-### Step 2b — Create the RDS instance
+### Step 3b — Create the RDS instance
 
 > RDS → **Create database**
 
@@ -460,11 +238,11 @@ the EC2 instance (via the default ALB behavior). The vendoring step is optional.
 3. DB instance identifier: `logistics-prod-pg`
 4. Master username: `appadmin`
 5. Master password: **type the strong password you generated above**
-   > Using the same password here and in §3 (Secrets Manager) keeps a single secret
+   > Using the same password here and in §4 (Secrets Manager) keeps a single secret
    > as the source of truth from day one — no post-creation sync required.
    >
    > **CLI note:** For the CLI path, use `--master-password <value>` with the password
-   > you generated. In §3 you will store this same password in Secrets Manager
+   > you generated. In §4 you will store this same password in Secrets Manager
    > (`rds/logistics-prod`), so both the RDS instance and the secret share the same
    > credentials from the start.
 6. DB instance class: `db.t4g.small` (**not** `db.t4g.micro` — micro does not support Multi-AZ)
@@ -487,7 +265,7 @@ the EC2 instance (via the default ALB behavior). The vendoring step is optional.
 
 ---
 
-## 3. Secrets Manager — DB credentials with rotation
+## 4. Secrets Manager — DB credentials with rotation
 
 > **Console:** Secrets Manager → **Store a new secret**
 
@@ -497,12 +275,12 @@ RDS is now available, so the secret can be fully configured in one pass:
 credentials stored, the RDS instance linked (so the secret type resolves
 correctly), and rotation enabled — all without leaving this section.
 
-### Step 3a — Store the secret
+### Step 4a — Store the secret
 
 1. Secret type: **Credentials for Amazon RDS database**
 2. Credentials:
    - Username: `appadmin`
-   - Password: **enter the same strong password you used in §2b**
+   - Password: **enter the same strong password you used in §3b**
 3. Select database: **`logistics-prod-pg`** ← select the instance you just created
 4. Secret name: `rds/logistics-prod`
 5. **Add an additional key:** `flask_secret_key` with a random 64-character hex value
@@ -527,9 +305,9 @@ correctly), and rotation enabled — all without leaving this section.
 > Manager.  Instances currently running use the cached credentials until
 > they restart (or you trigger an ASG instance refresh).
 
-### Step 3b — Note the Secret ARN
+### Step 4b — Note the Secret ARN
 
-Copy the ARN — you'll need it for the IAM role in §8.
+Copy the ARN — you'll need it for the IAM role in §9.
 
 > Teaching note: Secrets Manager eliminates hardcoded passwords.
 > The EC2 instance role grants `secretsmanager:GetSecretValue` on this one
@@ -538,14 +316,14 @@ Copy the ARN — you'll need it for the IAM role in §8.
 
 ---
 
-## 4. Cognito User Pool + Hosted UI
+## 5. Cognito User Pool + Hosted UI
 
 > **Console:** Cognito → **User pools** → **Create user pool**
 
 **CloudFormation:** `CognitoUserPool`, `CognitoUserPoolDomain`,
 `CognitoUserPoolClient`, `CognitoAdminsGroup`, `CognitoDriversGroup`
 
-### Step 4a — Create the user pool
+### Step 5a — Create the user pool
 
 1. **Sign-in experience** tab:
    - Sign-in options: check **Email**
@@ -561,7 +339,7 @@ Copy the ARN — you'll need it for the IAM role in §8.
    - User pool name: `logistics-prod-users`
    - Hosted UI: **do not enable Hosted UI here** — skip the "Use the Cognito Hosted UI"
      toggle entirely. The OAuth callback URL can only be set once the CloudFront domain
-     is known. You will enable Hosted UI and configure the callback in §10d.
+     is known. You will enable Hosted UI and configure the callback in §11d.
    - App type: **Public client**
    - App client name: `logistics-prod-web-client`
    - Client secret: **Don't generate** (public client — no secret)
@@ -569,8 +347,8 @@ Copy the ARN — you'll need it for the IAM role in §8.
 
 > **Why defer Hosted UI?** The Authorization Code Grant flow requires an exact-match
 > callback URL registered in Cognito — `https://<CF_DOMAIN>/auth/callback`. That domain
-> is only known after CloudFront is deployed in §10. Configuring it now would require a
-> placeholder URL that silently mismatches and causes login loops. Instead, §10d sets up
+> is only known after CloudFront is deployed in §11. Configuring it now would require a
+> placeholder URL that silently mismatches and causes login loops. Instead, §11d sets up
 > Hosted UI and OAuth immediately after the CloudFront domain is available.
 
 **After the pool is created — set the Cognito domain:**
@@ -581,9 +359,9 @@ Copy the ARN — you'll need it for the IAM role in §8.
   > The full domain becomes: `logistics-prod-auth-<AccountId>.auth.<Region>.amazoncognito.com`
 - Click **Create Cognito domain**
 
-Note the full domain — you'll paste it into the userdata in §11.
+Note the full domain — you'll paste it into the userdata in §12.
 
-### Step 4b — Create user groups
+### Step 5b — Create user groups
 
 > Select the user pool → **Groups** tab → **Create group**
 
@@ -594,7 +372,7 @@ Create two groups:
 | `Admins` | Full access to Flask-Admin GUI and all routes |
 | `Drivers` | Access to `/driver/` photo upload routes only |
 
-### Step 4c — Create test users
+### Step 5c — Create test users
 
 > **Groups** tab → **Users** tab → **Create user**
 
@@ -609,15 +387,15 @@ Create two groups:
 
 ---
 
-## 5. ACM Certificate — us-east-1 (for CloudFront)
+## 6. ACM Certificate — us-east-1 (for CloudFront)
 
 > **Console:** Switch region to **US East (N. Virginia)** → Certificate Manager → **Request a certificate**
 
-**CloudFormation:** `CloudFrontCertificate` (in cfn/02-edge.yaml, conditional)
+**CloudFormation:** `CloudFrontCertificate` (in cfn/template.yaml, conditional)
 
 > **This is the most important regional constraint in this project.**
 > Request this certificate first so DNS validation runs in parallel while you
-> complete §6–§9.
+> complete §7–§10.
 
 ### Why must this certificate be in us-east-1?
 
@@ -638,20 +416,20 @@ certificate dropdown.
 3. Click **Request**
 4. Expand the certificate → click **Create records in Route 53**
    (or copy the CNAME and add it manually to your DNS provider)
-5. DNS validation takes ~5 minutes. You don't need to wait — continue to §6.
+5. DNS validation takes ~5 minutes. You don't need to wait — continue to §7.
    CloudFront will only need this cert to be **Issued** by the time you create
-   the distribution in §10.
-6. Copy the **Certificate ARN** for use in §10.
+   the distribution in §11.
+6. Copy the **Certificate ARN** for use in §11.
 
 > **Exception — when app region IS us-east-1:** Both ALB and CloudFront are in
 > us-east-1, so ACM will deduplicate the certificate request. You can use the same
-> ARN for both the ALB listener in §7 and for CloudFront in §10 — no second cert
+> ARN for both the ALB listener in §8 and for CloudFront in §11 — no second cert
 > needed. If you request a second cert for the same domain in the same region, ACM
 > returns the existing one (not a duplicate).
 
 ---
 
-## 6. ACM Certificate — App Region (for ALB)
+## 7. ACM Certificate — App Region (for ALB)
 
 > **Console:** Certificate Manager → **Request a certificate**
 
@@ -660,7 +438,7 @@ certificate dropdown.
 > **Skip this section if you don't have a custom domain.**
 > The ALB works on HTTP:80. CloudFront enforces HTTPS for public users.
 >
-> **Skip this section if your app region is us-east-1** — use the cert ARN from §5
+> **Skip this section if your app region is us-east-1** — use the cert ARN from §6
 > for the ALB HTTPS listener. Both certificates cover the same domain, and ACM
 > deduplicates them in the same region.
 
@@ -669,20 +447,20 @@ certificate dropdown.
 3. Validation method: **DNS validation**
 4. Click **Request**
 5. Expand the certificate → click **Create records in Route 53**
-   (or copy the CNAME — it is the same CNAME as §5, already added, so validation
+   (or copy the CNAME — it is the same CNAME as §6, already added, so validation
    is instant)
 6. Wait for status to change from **Pending validation** to **Issued** (~5 minutes)
-7. Copy the **Certificate ARN** — you'll need it for the ALB HTTPS listener in §7
+7. Copy the **Certificate ARN** — you'll need it for the ALB HTTPS listener in §8
 
 ---
 
-## 7. ALB with HTTPS Listener
+## 8. ALB with HTTPS Listener
 
 > **Console:** EC2 → **Load Balancers** → **Create load balancer** → **Application Load Balancer**
 
 **CloudFormation:** `ApplicationLoadBalancer`, `TargetGroup`, `HttpListener`, `HttpsListener`
 
-### Step 7a — Create the ALB
+### Step 8a — Create the ALB
 
 1. Name: `logistics-prod-alb`
 2. Scheme: **Internet-facing**
@@ -692,7 +470,7 @@ certificate dropdown.
    - Inbound port 80 from `0.0.0.0/0` (CloudFront uses this)
    - Inbound port 443 from `0.0.0.0/0` (direct HTTPS access)
 
-### Step 7b — Create the target group
+### Step 8b — Create the target group
 
 1. Target type: **Instances**
 2. Name: `logistics-prod-tg`
@@ -701,11 +479,11 @@ certificate dropdown.
 5. Interval: 15 seconds
 6. Healthy threshold: 2, Unhealthy threshold: 3
 
-> The target group is empty at this point — the ASG instances are created in §11,
+> The target group is empty at this point — the ASG instances are created in §12,
 > after CloudFront is set up. CloudFront accepts an ALB origin whose target group
 > has zero healthy instances at creation time.
 
-### Step 7c — Listeners
+### Step 8c — Listeners
 
 **HTTP:80 listener** (forward — CloudFront uses this):
 - Protocol: HTTP, Port: 80
@@ -719,21 +497,21 @@ certificate dropdown.
 > CloudFront (which is correct), CloudFront would then try HTTP:80 on the ALB
 > again — and get another redirect.  This creates an infinite loop.
 > The HTTP→HTTPS enforcement happens at the **CloudFront viewer protocol policy**
-> (§10), not at the ALB.
+> (§11), not at the ALB.
 
-**HTTPS:443 listener** (skip if you don't have an ACM cert from §6):
+**HTTPS:443 listener** (skip if you don't have an ACM cert from §7):
 - Protocol: HTTPS, Port: 443
-- Certificate: select the cert you created in §6 (app region cert; or §5 if app region is us-east-1)
+- Certificate: select the cert you created in §7 (app region cert; or §6 if app region is us-east-1)
 - Security policy: **ELBSecurityPolicy-TLS13-1-2-2021-06**
 - Default action: **Forward** to `logistics-prod-tg`
 
 ---
 
-## 8. IAM Instance Role
+## 9. IAM Instance Role
 
 > **Console:** IAM → **Roles** → **Create role**
 
-**CloudFormation:** `AppInstanceRole`, `AppInstanceProfile` (in cfn/01-backend.yaml)
+**CloudFormation:** `AppInstanceRole`, `AppInstanceProfile` (in cfn/template.yaml)
 
 1. Trusted entity: **EC2**
 2. Name: `logistics-prod-app-role`
@@ -765,17 +543,17 @@ certificate dropdown.
 
 5. Create **Instance Profile** (same name as role — console does this automatically)
 
-> The Secret ARN you noted in §3b goes into the `Resource` field above. Using the
+> The Secret ARN you noted in §4b goes into the `Resource` field above. Using the
 > full ARN (rather than `*`) follows least-privilege: only this role can read this
 > one secret.
 
 ---
 
-## 9. WAF Web ACL
+## 10. WAF Web ACL
 
 > **Console:** Switch to region **us-east-1** → WAF & Shield → **Create web ACL**
 
-**CloudFormation:** `WafWebAcl` (in cfn/02-edge.yaml, always in us-east-1)
+**CloudFormation:** `WafWebAcl` (in cfn/template.yaml, always in us-east-1)
 
 > WAF Web ACLs with `Scope: CLOUDFRONT` must be in `us-east-1`.
 > This is the same constraint as the CloudFront ACM certificate.
@@ -793,18 +571,18 @@ certificate dropdown.
    - Action: **Block**
 5. Default action: **Allow**
 6. Click **Create web ACL** — do NOT associate with any resource yet (you'll
-   attach it to CloudFront in §10)
+   attach it to CloudFront in §11)
 
 ---
 
-## 10. CloudFront Distribution
+## 11. CloudFront Distribution
 
 > **Console:** CloudFront → **Create a CloudFront distribution**
 
 **CloudFormation:** `CloudFrontDistribution`, `OriginAccessControl`,
-`MediaBucketPolicy` (in cfn/02-edge.yaml)
+`MediaBucketPolicy` (in cfn/template.yaml)
 
-### Step 10a — Origin Access Control (for S3)
+### Step 11a — Origin Access Control (for S3)
 
 > CloudFront → **Origin access** → **Create control setting**
 
@@ -813,7 +591,7 @@ certificate dropdown.
 3. Origin type: **S3**
 4. Click **Create**
 
-### Step 10b — Create the distribution
+### Step 11b — Create the distribution
 
 **ALB Origin:**
 1. Origin domain: `logistics-prod-alb-xxxxxxx.us-east-1.elb.amazonaws.com`
@@ -848,18 +626,18 @@ MaxTTL=300, no cookies, no headers in the cache key.
 
 **Settings:**
 - Price class: **Use only North America and Europe** (demo — cheaper)
-- WAF: select `logistics-prod-waf` (created in §9)
+- WAF: select `logistics-prod-waf` (created in §10)
 - Custom domain (if you have one): add `logistics.example.com`
-- Custom certificate (if domain set): select the us-east-1 ACM cert from §5
+- Custom certificate (if domain set): select the us-east-1 ACM cert from §6
 - Default root object: leave blank (Flask handles `/`)
 - IPv6: enabled
 
 Click **Create distribution** — takes **10–15 minutes** to deploy globally.
 
 **Note the CloudFront domain** (e.g. `xxxx.cloudfront.net`) from the distribution
-detail page — you'll use it in §10c, §10d, and §11.
+detail page — you'll use it in §11c, §11d, and §12.
 
-### Step 10c — Add S3 bucket policy for OAC
+### Step 11c — Add S3 bucket policy for OAC
 
 After the distribution is created, the CloudFront console shows a banner:
 "You must update the S3 bucket policy to allow CloudFront to access it."
@@ -892,9 +670,11 @@ Paste the copied policy.  It looks like:
 > **Teaching point — OAC vs. making the bucket public:**
 > The `aws:SourceArn` condition ensures that ONLY this specific CloudFront
 > distribution can read the bucket.  Even someone who knows the S3 URL cannot
-> access the photos directly — they get a 403 (verified in smoke test §14).
+> access the photos directly — they get a 403 (verified in smoke test §15).
 
-### Step 10d — Enable Hosted UI and set Cognito callback URLs
+### Step 11d — Enable Hosted UI and set Cognito callback URLs
+
+> **CloudFormation note:** If you deployed via `cfn/template.yaml`, the callback and logout URLs are wired automatically at deploy time — `CognitoUserPoolClient` references `CloudFrontDistribution.DomainName` directly. You can skip this step for CFN deployments and verify with `aws cognito-idp describe-user-pool-client ...` that the URLs already contain your CloudFront domain.
 
 Now that you have the CloudFront domain (e.g. `xxxx.cloudfront.net`):
 
@@ -914,7 +694,7 @@ no placeholder was ever registered.
 
 ---
 
-## 11. Launch Template + Auto Scaling Group
+## 12. Launch Template + Auto Scaling Group
 
 > **Console:** EC2 → **Launch Templates** → **Create launch template**
 
@@ -922,20 +702,20 @@ no placeholder was ever registered.
 
 > **Before starting:** collect the following values from earlier sections —
 > you will paste them directly into the userdata below:
-> - CloudFront domain from §10b (e.g. `xxxx.cloudfront.net`)
-> - Cognito User Pool ID from §4a
-> - Cognito App Client ID from §4a
-> - Cognito Hosted Domain from §4a (e.g. `logistics-prod-auth-ACCOUNT.auth.REGION.amazoncognito.com`)
-> - Media bucket name from §1
+> - CloudFront domain from §11b (e.g. `xxxx.cloudfront.net`)
+> - Cognito User Pool ID from §5a
+> - Cognito App Client ID from §5a
+> - Cognito Hosted Domain from §5a (e.g. `logistics-prod-auth-ACCOUNT.auth.REGION.amazoncognito.com`)
+> - Media bucket name from §2 (S3 Media Bucket)
 
-### Step 11a — Launch Template
+### Step 12a — Launch Template
 
 1. Name: `logistics-prod-lt`
 2. AMI: use the SSM-resolved path for Amazon Linux 2023 ARM64:
    `{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}`
    Or search for `al2023-ami-kernel-default-arm64` in AMI catalog
 3. Instance type: `t4g.small`
-4. IAM instance profile: `logistics-prod-app-role` (created in §8)
+4. IAM instance profile: `logistics-prod-app-role` (created in §9)
 5. Security group: `logistics-prod-app-sg` (allows inbound 80 from ALB SG)
 6. Metadata options: IMDSv2 **Required**
 7. User data: paste the script below, replacing placeholders with the values
@@ -955,7 +735,7 @@ COGNITO_POOL_ID="YOUR_USER_POOL_ID"
 COGNITO_CLIENT="YOUR_CLIENT_ID"
 COGNITO_HOSTED_DOMAIN="YOUR_PREFIX-YOUR_ACCOUNT_ID.auth.YOUR_REGION.amazoncognito.com"
 MEDIA_BUCKET="logistics-prod-media-YOUR_ACCOUNT_ID"
-APP_URL="https://YOUR_CLOUDFRONT_DOMAIN"   # From §10b — e.g. https://xxxx.cloudfront.net
+APP_URL="https://YOUR_CLOUDFRONT_DOMAIN"   # From §11b — e.g. https://xxxx.cloudfront.net
 
 # Base packages
 dnf update -y
@@ -1028,7 +808,7 @@ systemctl enable --now flask-admin nginx
 echo "user-data OK"
 ```
 
-### Step 11b — Auto Scaling Group
+### Step 12b — Auto Scaling Group
 
 > EC2 → **Auto Scaling Groups** → **Create Auto Scaling group**
 
@@ -1045,19 +825,19 @@ echo "user-data OK"
 
 ---
 
-## 12. Schema Bootstrap via SSM Run Command
+## 13. Schema Bootstrap via SSM Run Command
 
 **Wait until at least one ASG instance shows "healthy" in the target group.**
 
 ```bash
 # Option A: use the provided script (recommended — handles credentials automatically)
-BACKEND_STACK=logistics-prod-backend APP_REGION=us-east-1 \
+BACKEND_STACK=logistics-prod APP_REGION=us-east-1 \
   ./ssm-run-schema-from-artifact.sh
 
 # Option B: manual SSM send-command
 # Step 1: get the DB password from Secrets Manager
 SECRET_ARN=$(aws cloudformation describe-stacks \
-  --stack-name logistics-prod-backend --region us-east-1 \
+  --stack-name logistics-prod --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='SecretArn'].OutputValue | [0]" \
   --output text)
 
@@ -1067,12 +847,14 @@ DB_PASS=$(aws secretsmanager get-secret-value \
   python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
 
 DB_ENDPOINT=$(aws cloudformation describe-stacks \
-  --stack-name logistics-prod-backend --region us-east-1 \
+  --stack-name logistics-prod --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='DbEndpoint'].OutputValue | [0]" \
   --output text)
 
+# Note: use the ASG autoscaling group name tag, not the launch template Name tag.
+# The ASG overrides the EC2 Name tag on instances — filter by the ASG groupName attribute.
 INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 \
-  --filters "Name=tag:aws:autoscaling:groupName,Values=logistics-prod-backend-asg" \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=logistics-prod-asg" \
             "Name=instance-state-name,Values=running" \
   --query "Reservations[0].Instances[0].InstanceId" --output text)
 
@@ -1094,11 +876,11 @@ Verify: visit `http://<ALB-DNS>/dashboard` — you should see 10 customers,
 
 ---
 
-## 13. Route 53 Alias (Optional)
+## 14. Route 53 Alias (Optional)
 
 > **Console:** Route 53 → **Hosted zones** → select your zone → **Create record**
 
-**CloudFormation:** `Route53Record` (conditional in 02-edge.yaml)
+**CloudFormation:** `Route53Record` (conditional in cfn/template.yaml)
 
 1. Record name: `logistics` (for `logistics.example.com`)
 2. Record type: **A**
@@ -1111,7 +893,7 @@ Verify: visit `http://<ALB-DNS>/dashboard` — you should see 10 customers,
 
 ---
 
-## 14. End-to-End Smoke Test
+## 15. End-to-End Smoke Test
 
 Wait for all resources to be healthy before testing:
 - ALB target group: all instances `healthy`
@@ -1121,12 +903,12 @@ Wait for all resources to be healthy before testing:
 
 ```bash
 # Get your CloudFront domain from the stack output:
-CF_DOMAIN=$(aws cloudformation describe-stacks --stack-name logistics-prod-edge \
+CF_DOMAIN=$(aws cloudformation describe-stacks --stack-name logistics-prod \
   --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='DistributionDomain'].OutputValue | [0]" \
   --output text | sed 's|https://||')
 
-MEDIA_BUCKET=$(aws cloudformation describe-stacks --stack-name logistics-prod-backend \
+MEDIA_BUCKET=$(aws cloudformation describe-stacks --stack-name logistics-prod \
   --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='MediaBucketName'].OutputValue | [0]" \
   --output text)
@@ -1150,7 +932,7 @@ open "https://$CF_DOMAIN/admin/"
 
 1. Open `https://$CF_DOMAIN/admin/` in a browser
 2. Redirected to Cognito Hosted UI login page
-3. Sign in as the Admin user (created in §4c)
+3. Sign in as the Admin user (created in §5c)
 4. Redirected back to Flask-Admin — you see Customers, Drivers, Shipments tables
 5. Sign out (menu link in Flask-Admin)
 6. Sign in as Driver user — you should see 403 on `/admin/` (Drivers group only allows `/driver/`)
@@ -1161,16 +943,16 @@ open "https://$CF_DOMAIN/admin/"
 
 ---
 
-## 15. Cleanup
+## 16. Cleanup
 
 **Order matters** — CloudFront must be disabled before deletion, and the
 distribution takes ~15 minutes to disable globally.
 
-### 15a — Disable CloudFront first
+### 16a — Disable CloudFront first
 
 > CloudFront → select distribution → **Disable** → wait for `Status = Deployed`
 
-### 15b — Delete resources in reverse order
+### 16b — Delete resources in reverse order
 
 ```bash
 # 1. Delete CloudFront distribution (after it's disabled)
@@ -1194,9 +976,9 @@ aws wafv2 delete-web-acl \
 aws s3 rm s3://logistics-prod-media-ACCOUNT --recursive
 aws s3 rb s3://logistics-prod-media-ACCOUNT
 
-# 5. Delete CloudFormation stacks
-aws cloudformation delete-stack --stack-name logistics-prod-edge   --region us-east-1
-aws cloudformation delete-stack --stack-name logistics-prod-backend --region YOUR_REGION
+# 5. Delete CloudFormation stack
+aws cloudformation delete-stack --stack-name logistics-prod --region us-east-1
+aws cloudformation wait stack-delete-complete --stack-name logistics-prod --region us-east-1
 
 # 6. Delete Cognito User Pool (if not in CloudFormation)
 # 7. Delete Secrets Manager secret
@@ -1206,7 +988,7 @@ aws cloudformation delete-stack --stack-name logistics-prod-backend --region YOU
 
 ---
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 ### Cert region mismatch (CloudFront shows "No certificate available")
 
@@ -1217,7 +999,7 @@ is empty or your cert doesn't appear.
 cert to be in `us-east-1`.
 
 **Fix:** Go to `us-east-1` → Certificate Manager → request the cert again.
-Validate with the same CNAME (already in DNS from §5 or §6 — it validates instantly).
+Validate with the same CNAME (already in DNS from §6 or §7 — it validates instantly).
 
 ---
 
@@ -1243,7 +1025,7 @@ Validate with the same CNAME (already in DNS from §5 or §6 — it validates in
    Update DB records: `UPDATE shipments SET proof_photo_key = 'media/' || proof_photo_key WHERE proof_photo_key NOT LIKE 'media/%';`
 
 2. **Bucket policy not applied** — Go to S3 → bucket → Permissions → Bucket policy.
-   If empty, paste the policy from §10c.
+   If empty, paste the policy from §11c.
 
 3. **Wrong S3 origin format** — The S3 origin domain must be in path-style format:
    `bucket-name.s3.region.amazonaws.com`
@@ -1346,7 +1128,7 @@ exactly match the URL the app sends in the authorization request.
 
 **Symptom:** `DBSecretRotation CREATE_FAILED: To use the HostedRotationLambda property, you must use the AWS::SecretsManager transform`
 
-**Fix:** Add `Transform: AWS::SecretsManager-2020-07-23` at the top of `01-backend.yaml` (alongside `AWSTemplateFormatVersion`) and add `CAPABILITY_AUTO_EXPAND` to the deploy command:
+**Fix:** Add `Transform: AWS::SecretsManager-2020-07-23` at the top of `cfn/template.yaml` (alongside `AWSTemplateFormatVersion`) and add `CAPABILITY_AUTO_EXPAND` to the deploy command:
 
 ```bash
 aws cloudformation create-stack ... \
@@ -1365,22 +1147,9 @@ This is a Secrets Manager-specific macro transform — distinct from the SAM tra
 
 ---
 
-### CFN: `VpcStackName` must match the actual exporting stack name
-
-**Symptom:** `ROLLBACK_IN_PROGRESS: No export named VPC1-VPC1-PrivateRouteTableId found`
-
-**Fix:** Check what prefix your VPC stack actually exports:
-```bash
-aws cloudformation list-exports --region us-east-1 \
-  --query 'Exports[?contains(Name,`VPC`)].Name' --output table
-```
-The export names follow `<StackName>-<VpcName>-<Resource>`. Pass the actual stack name as `VpcStackName`, not the VPC name.
-
----
-
 ### CFN: retained S3 bucket blocks re-deploy
 
-**Symptom:** After a failed stack (ROLLBACK_COMPLETE) and delete, the next `create-stack` fails with `logistics-prod-backend-media-ACCOUNT already exists`.
+**Symptom:** After a failed stack (ROLLBACK_COMPLETE) and delete, the next `create-stack` fails with `logistics-prod-media-ACCOUNT already exists`.
 
 **Cause:** `DeletionPolicy: Retain` on the media bucket means it survives stack deletion. The next deploy tries to create the same bucket name and collides.
 
@@ -1407,15 +1176,11 @@ proceed to functional (B) tests.
 
 ```bash
 export APP_REGION=us-east-1
-export EDGE_REGION=us-east-1
-export BACKEND_STACK=logistics-prod-backend
-export EDGE_STACK=logistics-prod-edge
+export STACK=logistics-prod
 
-# A1. Templates validate
+# A1. Template validates
 aws cloudformation validate-template \
-  --template-body file://cfn/01-backend.yaml --region "$APP_REGION"
-aws cloudformation validate-template \
-  --template-body file://cfn/02-edge.yaml    --region "$EDGE_REGION"
+  --template-body file://cfn/template.yaml --region "$APP_REGION"
 
 # A4. RDS is Multi-AZ
 aws rds describe-db-instances \
@@ -1434,4 +1199,116 @@ aws wafv2 get-web-acl --scope CLOUDFRONT --region us-east-1 \
 # Expect: AWS-AWSManagedRulesCommonRuleSet
 #         AWS-AWSManagedRulesAmazonIpReputationList
 #         RateLimit
+
+# A12. Cognito callback URLs wired to real CloudFront domain (not a placeholder)
+CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+  --region "$APP_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='CognitoClientId'].OutputValue | [0]" \
+  --output text)
+POOL_ID=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+  --region "$APP_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue | [0]" \
+  --output text)
+aws cognito-idp describe-user-pool-client \
+  --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID" \
+  --region "$APP_REGION" \
+  --query 'UserPoolClient.CallbackURLs'
+# Expect: URLs containing your actual CloudFront domain (no placeholder)
 ```
+
+---
+
+## Appendix C — Deploy via CloudFormation (shortcut)
+
+> **When to use this:** If you've already walked through the console once and understand what each resource does, this shortcut deploys the entire stack from scratch with a single CLI command — useful for classroom resets, teardown-and-rebuild, or CI testing.
+
+**Prerequisites:**
+- AWS CLI configured (`aws configure` or environment credentials)
+- App zip uploaded to your artifact bucket (§0a)
+- A unique Cognito domain prefix chosen (e.g. `logistics-prod-auth-<AccountId>`)
+- Deploy to **us-east-1** (CloudFront/WAF/ACM are control-plane-locked to us-east-1; `cfn/template.yaml` is a merged single-stack template that assumes this region)
+
+> **Note for non-us-east-1 backends:** If you need the backend in a different region, the original two-stack layout (`01-backend.yaml` + `02-edge.yaml`) is preserved in git history. The merged single template is the right path for standard classroom deployments.
+
+### Step C1 — Deploy the stack
+
+```bash
+export APP_REGION=us-east-1
+export ARTIFACT_BUCKET=logistics-prod-artifacts-YOUR_ACCOUNT_ID
+export COGNITO_PREFIX=logistics-prod-auth-YOUR_ACCOUNT_ID   # must be globally unique
+
+aws cloudformation create-stack \
+  --stack-name logistics-prod \
+  --template-body file://cfn/template.yaml \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+  --region "$APP_REGION" \
+  --parameters \
+    ParameterKey=ArtifactBucket,ParameterValue="$ARTIFACT_BUCKET" \
+    ParameterKey=CognitoDomainPrefix,ParameterValue="$COGNITO_PREFIX"
+```
+
+**Optional overrides** (all have defaults — omit to accept defaults):
+
+| Parameter | Default | Override example |
+|---|---|---|
+| `ArtifactKey` | `logistics-prod/app.zip` | `logistics-prod/v2/app.zip` |
+| `AppInstanceType` | `t4g.small` | `t4g.medium` |
+| `DbInstanceClass` | `db.t4g.small` | `db.t4g.medium` |
+| `DomainName` | *(empty — CloudFront default domain)* | `logistics.example.com` |
+| `HostedZoneId` | *(empty — no Route 53 alias)* | `Z1234567890` |
+| `AdminInitialEmail` | *(empty — create users manually)* | `admin@example.com` |
+| `VpcCidr` | `10.20.0.0/16` | `10.30.0.0/16` |
+
+Wait for `CREATE_COMPLETE` (~15 minutes — RDS Multi-AZ and CloudFront dominate):
+
+```bash
+aws cloudformation wait stack-create-complete \
+  --stack-name logistics-prod \
+  --region "$APP_REGION"
+```
+
+### Step C2 — Get your CloudFront URL
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name logistics-prod \
+  --region "$APP_REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`PublicUrl`].OutputValue' \
+  --output text
+```
+
+Cognito callback URLs are wired automatically — no manual update required. Verify:
+
+```bash
+CLIENT_ID=$(aws cloudformation describe-stacks --stack-name logistics-prod \
+  --region "$APP_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='CognitoClientId'].OutputValue | [0]" \
+  --output text)
+POOL_ID=$(aws cloudformation describe-stacks --stack-name logistics-prod \
+  --region "$APP_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue | [0]" \
+  --output text)
+aws cognito-idp describe-user-pool-client \
+  --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID" \
+  --region "$APP_REGION" \
+  --query 'UserPoolClient.CallbackURLs'
+```
+
+### Step C3 — Bootstrap the database schema
+
+Once at least one ASG instance is healthy, run the schema bootstrap via SSM (same as §13):
+
+```bash
+BACKEND_STACK=logistics-prod APP_REGION="$APP_REGION" \
+  ./scripts/ssm-run-schema-from-artifact.sh
+```
+
+### Cleanup
+
+```bash
+# CloudFront distribution takes 10-15 min to disable/delete — single wait covers all
+aws cloudformation delete-stack --stack-name logistics-prod --region "$APP_REGION"
+aws cloudformation wait stack-delete-complete --stack-name logistics-prod --region "$APP_REGION"
+```
+
+> **Note:** The media S3 bucket has `DeletionPolicy: Retain` — it survives stack deletion. Delete it manually for a full teardown: `aws s3 rb s3://logistics-prod-media-ACCOUNT_ID --force`.

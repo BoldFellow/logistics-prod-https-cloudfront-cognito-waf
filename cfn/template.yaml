@@ -1,30 +1,43 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::SecretsManager-2020-07-23
 Description: >
-  Logistics-Prod Backend Stack — Cognito + Secrets Manager (rotation) +
-  RDS PostgreSQL Multi-AZ + ALB (HTTP:80 forward + optional HTTPS:443) +
-  ASG + S3 media bucket + CloudWatch alarms.
-  Subnets imported from VpcStackName/VpcName exports (same VPC as Logistics).
-  Deploy this stack first.  Then deploy 02-edge.yaml (always in us-east-1).
+  Logistics-Prod  -  single self-contained stack. Cognito + Secrets Manager (rotation) +
+  RDS PostgreSQL Multi-AZ + ALB + ASG + S3 media bucket + CloudFront + WAFv2 + OAC +
+  Route 53 (optional) + CloudWatch alarms.
+  Self-contained: creates its own VPC, subnets, IGW, route tables, and NAT.
+
+  NOTE: This template assumes deployment in us-east-1. CloudFront distributions and WAF
+  Web ACLs with scope=CLOUDFRONT, and ACM certificates for CloudFront, must reside in
+  us-east-1. For deployments where the backend must run in a non-us-east-1 region,
+  split back into 01-backend.yaml + 02-edge.yaml (preserved in git history).
 
 # ============================================================================
 # PARAMETERS
 # ============================================================================
 Parameters:
 
-  # ---- Cross-stack networking (reuse from existing Logistics VPC) -----------
-  VpcStackName:
+  # ---- VPC networking (self-contained  -  stack creates its own VPC) ----------
+  VpcCidr:
     Type: String
-    Description: Name of the VPC CloudFormation stack to import subnet/VPC IDs from.
-
-  VpcName:
+    Default: 10.20.0.0/16
+  PublicSubnetACidr:
     Type: String
-    Default: VPC1
-    Description: VPC name within the VPC stack (Vpc1Name or Vpc2Name).
-
-  BastionSecurityGroupId:
-    Type: AWS::EC2::SecurityGroup::Id
-    Description: SG of the bastion host — granted RDS:5432 ingress for schema bootstrap.
+    Default: 10.20.0.0/24
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.20.1.0/24
+  AppSubnetACidr:
+    Type: String
+    Default: 10.20.10.0/24
+  AppSubnetBCidr:
+    Type: String
+    Default: 10.20.11.0/24
+  DbSubnetACidr:
+    Type: String
+    Default: 10.20.20.0/24
+  DbSubnetBCidr:
+    Type: String
+    Default: 10.20.21.0/24
 
   # ---- Application artifact -------------------------------------------------
   ArtifactBucket:
@@ -91,17 +104,24 @@ Parameters:
       Cognito sends a temporary password; user sets a permanent one on first login.
       Leave empty to create users manually in the Cognito console.
 
-  # ---- HTTPS (optional) -----------------------------------------------------
+  # ---- Custom domain (optional) --------------------------------------------
   DomainName:
     Type: String
     Default: ""
     Description: >
       Optional. Your custom domain (e.g. logistics.example.com).
-      If provided, an ACM certificate is created for this domain and attached
-      to the ALB HTTPS:443 listener. DNS validation — you must add the CNAME
-      record to your DNS provider before the stack can complete.
-      Leave empty to skip HTTPS on the ALB (CloudFront still enforces HTTPS
-      for public users via its viewer protocol policy).
+      If provided, ACM certificates are created for both the ALB (in this region) and
+      CloudFront (in us-east-1  -  same cert when deploying to us-east-1), and the
+      CloudFront distribution lists this domain as an alias (CNAME).
+      DNS validation  -  you must add the CNAME record to your DNS provider.
+      Leave empty to use the auto-assigned *.cloudfront.net URL.
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Route 53 Hosted Zone ID for DomainName.
+      Required only if DomainName is set and you want an A-alias record created.
 
   # ---- VPC endpoint toggles (set to false if another stack already owns them)
   CreateS3GatewayEndpoint:
@@ -117,8 +137,8 @@ Parameters:
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
-      - Label: { default: "VPC (cross-stack import)" }
-        Parameters: [VpcStackName, VpcName, BastionSecurityGroupId]
+      - Label: { default: "VPC networking (self-contained)" }
+        Parameters: [VpcCidr, PublicSubnetACidr, PublicSubnetBCidr, AppSubnetACidr, AppSubnetBCidr, DbSubnetACidr, DbSubnetBCidr]
       - Label: { default: "Application artifact" }
         Parameters: [ArtifactBucket, ArtifactKey]
       - Label: { default: "Compute" }
@@ -127,8 +147,8 @@ Metadata:
         Parameters: [DbInstanceClass, DbAllocatedStorage, DbSecretName]
       - Label: { default: "Cognito" }
         Parameters: [CognitoDomainPrefix, AdminInitialEmail]
-      - Label: { default: "HTTPS (optional)" }
-        Parameters: [DomainName]
+      - Label: { default: "Custom domain (optional)" }
+        Parameters: [DomainName, HostedZoneId]
       - Label: { default: "VPC endpoint toggles" }
         Parameters: [CreateS3GatewayEndpoint, CreateInterfaceEndpoints]
 
@@ -137,6 +157,9 @@ Metadata:
 # ============================================================================
 Conditions:
   HasCustomDomain:         !Not [!Equals [!Ref DomainName, ""]]
+  HasHostedZone:           !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
   CreateInitialAdminUser:  !Not [!Equals [!Ref AdminInitialEmail, ""]]
   ShouldCreateS3Endpoint:  !Equals [!Ref CreateS3GatewayEndpoint, "true"]
   ShouldCreateInterfaceEndpoints: !Equals [!Ref CreateInterfaceEndpoints, "true"]
@@ -147,11 +170,167 @@ Conditions:
 Resources:
 
   # ---------------------------------------------------------------------------
+  # VPC, Subnets, Internet Gateway, Route Tables
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-a"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-b"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref AppSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app-a"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref AppSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app-b"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref DbSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-a"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref DbSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-b"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  AppSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  AppSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
   # Cognito User Pool
   #
   # Teaching points:
   #   * Cognito is the source of truth for identity (no users table in the DB).
-  #   * Hosted UI handles login / MFA / password reset — zero auth UI to build.
+  #   * Hosted UI handles login / MFA / password reset  -  zero auth UI to build.
   #   * id_token is a signed JWT. Flask validates it using the Cognito JWKS
   #     endpoint (public keys). No Cognito API call needed per request.
   #   * Groups (Admins / Drivers) are embedded in the id_token as
@@ -189,7 +368,7 @@ Resources:
     Properties:
       UserPoolId: !Ref CognitoUserPool
       ClientName: !Sub "${AWS::StackName}-web-client"
-      GenerateSecret: false  # Public client — safe because token exchange is server-side
+      GenerateSecret: false  # Public client  -  safe because token exchange is server-side
       AllowedOAuthFlowsUserPoolClient: true
       AllowedOAuthFlows:
         - code               # Authorization Code flow (most secure for web apps)
@@ -199,13 +378,14 @@ Resources:
         - profile
       SupportedIdentityProviders:
         - COGNITO
-      # Callback URLs -- update these after you know your CloudFront domain.
-      # You can add both the *.cloudfront.net URL and your custom domain.
-      # The app reads APP_URL from its environment; the callback is APP_URL/auth/callback.
+      # Callback URLs are automatically wired to the CloudFront domain.
+      # When HasCustomDomain is true the custom domain is added as a second entry.
       CallbackURLs:
-        - !Sub "https://placeholder.cloudfront.net/auth/callback"
+        - !Sub "https://${CloudFrontDistribution.DomainName}/auth/callback"
+        - !If [HasCustomDomain, !Sub "https://${DomainName}/auth/callback", !Ref "AWS::NoValue"]
       LogoutURLs:
-        - !Sub "https://placeholder.cloudfront.net/"
+        - !Sub "https://${CloudFrontDistribution.DomainName}/"
+        - !If [HasCustomDomain, !Sub "https://${DomainName}/", !Ref "AWS::NoValue"]
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
@@ -252,9 +432,9 @@ Resources:
   # ACM Certificate (app region, for ALB HTTPS:443)
   #
   # Teaching note: CloudFront requires its certificate in us-east-1.
-  # This certificate is DIFFERENT — it's for the ALB in whatever region you
-  # chose for this stack (may also be us-east-1, or another region).
-  # Having two separate certs makes the regional constraint visible.
+  # This certificate is for the ALB in the stack's deployment region.
+  # When deploying to us-east-1, CloudFront can reuse the same cert ARN for
+  # both the ALB listener and the CloudFront distribution.
   # ---------------------------------------------------------------------------
   AlbCertificate:
     Condition: HasCustomDomain
@@ -269,12 +449,12 @@ Resources:
           Value: "true"
 
   # ---------------------------------------------------------------------------
-  # Secrets Manager — DB credentials with automatic rotation
+  # Secrets Manager  -  DB credentials with automatic rotation
   #
   # Teaching points:
   #   * The secret is pre-created with username/engine/dbname/port.
   #   * SecretTargetAttachment patches the host/port in after RDS exists.
-  #   * RotationSchedule uses HostedRotationLambda — CloudFormation deploys
+  #   * RotationSchedule uses HostedRotationLambda  -  CloudFormation deploys
   #     the rotation Lambda automatically (no SAM transform needed).
   #   * The Lambda runs inside the VPC so it can reach RDS:5432 directly.
   #   * After each rotation, app.py reads the NEW credentials from Secrets
@@ -318,8 +498,8 @@ Resources:
         VpcSecurityGroupIds: !Ref AppSecurityGroup
         VpcSubnetIds: !Join
           - ","
-          - - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
-            - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+          - - !Ref AppSubnetA
+            - !Ref AppSubnetB
       RotationRules:
         AutomaticallyAfterDays: 30
 
@@ -327,7 +507,7 @@ Resources:
   # S3 Media Bucket
   #
   # Stores proof-of-delivery photos uploaded by drivers.
-  # All public access is blocked — only CloudFront can read via OAC.
+  # All public access is blocked  -  only CloudFront can read via OAC.
   # App instances write via IAM instance role (AppInstanceRole below).
   # ---------------------------------------------------------------------------
   MediaBucket:
@@ -358,8 +538,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: ALB - HTTP:80 (CloudFront) and HTTPS:443 (direct access)
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -381,8 +560,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: App EC2 instances - only ALB can reach port 80
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-app-sg"
@@ -402,9 +580,8 @@ Resources:
   RdsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: PostgreSQL - app tier + bastion + rotation Lambda
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      GroupDescription: PostgreSQL - app tier + rotation Lambda
+      VpcId: !Ref Vpc
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-rds-sg"
@@ -421,23 +598,12 @@ Resources:
       SourceSecurityGroupId: !Ref AppSecurityGroup
       Description: Postgres from app tier and rotation Lambda (both use AppSecurityGroup)
 
-  RdsFromBastionIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref RdsSecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref BastionSecurityGroupId
-      Description: Postgres from bastion for schema bootstrap
-
   VpcEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Condition: ShouldCreateInterfaceEndpoints
     Properties:
       GroupDescription: HTTPS from app instances to interface endpoints
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
@@ -457,24 +623,22 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Condition: ShouldCreateS3Endpoint
     Properties:
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
       VpcEndpointType: Gateway
       RouteTableIds:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateRouteTableId"
+        - !Ref PrivateRouteTable
 
   SecretsManagerEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Condition: ShouldCreateInterfaceEndpoints
     Properties:
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
       VpcEndpointType: Interface
       SubnetIds:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+        - !Ref AppSubnetA
+        - !Ref AppSubnetB
       SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
       PrivateDnsEnabled: true
 
@@ -482,13 +646,12 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Condition: ShouldCreateInterfaceEndpoints
     Properties:
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
       VpcEndpointType: Interface
       SubnetIds:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+        - !Ref AppSubnetA
+        - !Ref AppSubnetB
       SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
       PrivateDnsEnabled: true
 
@@ -496,13 +659,12 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Condition: ShouldCreateInterfaceEndpoints
     Properties:
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
       VpcEndpointType: Interface
       SubnetIds:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+        - !Ref AppSubnetA
+        - !Ref AppSubnetB
       SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
       PrivateDnsEnabled: true
 
@@ -510,13 +672,12 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Condition: ShouldCreateInterfaceEndpoints
     Properties:
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
       VpcEndpointType: Interface
       SubnetIds:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+        - !Ref AppSubnetA
+        - !Ref AppSubnetB
       SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
       PrivateDnsEnabled: true
 
@@ -537,8 +698,7 @@ Resources:
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NatEip.AllocationId
-      SubnetId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PublicSubnetAId"
+      SubnetId: !Ref PublicSubnetA
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-nat-gw"
@@ -548,19 +708,18 @@ Resources:
   PrivateDefaultRoute:
     Type: AWS::EC2::Route
     Properties:
-      RouteTableId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateRouteTableId"
+      RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NatGateway
 
   # ---------------------------------------------------------------------------
-  # RDS PostgreSQL — Multi-AZ, 7-day backups, encrypted
+  # RDS PostgreSQL  -  Multi-AZ, 7-day backups, encrypted
   #
   # Teaching point vs. original Logistics:
-  #   * MultiAZ: true  — standby replica in a second AZ.
-  #     RDS automatically fails over in ~15–60s if the primary becomes
+  #   * MultiAZ: true   -  standby replica in a second AZ.
+  #     RDS automatically fails over in ~15-60s if the primary becomes
   #     unavailable. The endpoint DNS name is updated automatically.
-  #   * BackupRetentionPeriod: 7 — keep 7 days of automated backups.
+  #   * BackupRetentionPeriod: 7  -  keep 7 days of automated backups.
   #     Original Logistics kept only 1.
   # ---------------------------------------------------------------------------
   DBSubnetGroup:
@@ -569,8 +728,8 @@ Resources:
       DBSubnetGroupName: !Sub "${AWS::StackName}-db-subnet-group"
       DBSubnetGroupDescription: DB subnets for Logistics-Prod RDS.
       SubnetIds:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-DbSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-DbSubnetBId"
+        - !Ref DbSubnetA
+        - !Ref DbSubnetB
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-db-subnet-group"
@@ -604,7 +763,7 @@ Resources:
           Value: "true"
 
   # ---------------------------------------------------------------------------
-  # IAM — EC2 instance role
+  # IAM  -  EC2 instance role
   # ---------------------------------------------------------------------------
   AppInstanceRole:
     Type: AWS::IAM::Role
@@ -636,7 +795,7 @@ Resources:
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactKey}"
               # Write proof-of-delivery photos to the media bucket.
-              # Key prefix must be media/shipments/* to match the CloudFront /media/* → S3 path.
+              # Key prefix must be media/shipments/* to match the CloudFront /media/* -> S3 path.
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub "${MediaBucket.Arn}/media/*"
@@ -659,16 +818,16 @@ Resources:
   # ---------------------------------------------------------------------------
   # Application Load Balancer
   #
-  # HTTP:80  — forwarding to target group.
+  # HTTP:80   -  forwarding to target group.
   #            CloudFront uses this as the ALB origin (HTTP:80).
-  # HTTPS:443 — forwarding to target group (only created if DomainName is set).
+  # HTTPS:443  -  forwarding to target group (only created if DomainName is set).
   #             Useful for direct admin access.
   #
-  # Teaching note on CloudFront → ALB protocol:
+  # Teaching note on CloudFront -> ALB protocol:
   #   CloudFront uses HTTP:80 to communicate with the ALB.
   #   All public user traffic arrives at CloudFront over HTTPS (enforced by
-  #   the viewer protocol policy in 02-edge.yaml). The CloudFront → ALB
-  #   leg stays within AWS network infrastructure.
+  #   the viewer protocol policy in the CloudFront distribution). The
+  #   CloudFront -> ALB leg stays within AWS network infrastructure.
   #   In production with a custom origin domain + matching cert, you would
   #   configure OriginProtocolPolicy: https-only in the CloudFront distribution.
   # ---------------------------------------------------------------------------
@@ -680,8 +839,8 @@ Resources:
       Scheme: internet-facing
       SecurityGroups: [!Ref AlbSecurityGroup]
       Subnets:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PublicSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PublicSubnetBId"
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-alb"
@@ -692,8 +851,7 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Name: !Sub "${AWS::StackName}-tg"
-      VpcId:
-        Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-VpcId"
+      VpcId: !Ref Vpc
       Protocol: HTTP
       Port: 80
       TargetType: instance
@@ -708,7 +866,7 @@ Resources:
         - Key: ManagedByCloudFormation
           Value: "true"
 
-  # HTTP:80 forwarding listener — used by CloudFront as the ALB origin.
+  # HTTP:80 forwarding listener  -  used by CloudFront as the ALB origin.
   HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -719,7 +877,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
-  # HTTPS:443 listener — only created when DomainName (and cert) is provided.
+  # HTTPS:443 listener  -  only created when DomainName (and cert) is provided.
   HttpsListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: HasCustomDomain
@@ -742,10 +900,14 @@ Resources:
   #   COGNITO_CLIENT_ID    -- for JWT audience validation
   #   COGNITO_DOMAIN       -- for Hosted UI login/token URLs
   #   S3_MEDIA_BUCKET      -- for boto3 put_object in driver_photo_upload
-  #   APP_URL              -- for OAuth callback URL (update after CloudFront deploy)
+  #   APP_URL              -- automatically set from CloudFront domain at deploy time
+  #
+  # AppLaunchTemplate depends on CloudFrontDistribution so instances receive
+  # the real APP_URL at first boot with no manual intervention.
   # ---------------------------------------------------------------------------
   AppLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
+    DependsOn: CloudFrontDistribution
     Properties:
       LaunchTemplateName: !Sub "${AWS::StackName}-lt"
       LaunchTemplateData:
@@ -803,13 +965,8 @@ Resources:
               # ---- 5. Flask secret key (random per instance, rotate on ASG refresh) ----
               FLASK_KEY="$(openssl rand -hex 32)"
 
-              # APP_URL is set to a placeholder here.
-              # UPDATE THIS after you have your CloudFront domain:
-              #   aws cloudformation update-stack --stack-name <backend-stack> \
-              #     --use-previous-template \
-              #     --parameters ParameterKey=AppUrl,ParameterValue=https://<dist>.cloudfront.net \
-              #     ... (or trigger an instance refresh to pick up the new env var)
-              APP_URL_VALUE="${DomainName}"
+              # APP_URL is resolved at stack deploy time from the CloudFront distribution.
+              APP_URL_VALUE="${AppUrl}"
 
               # ---- 6. systemd unit for gunicorn ----
               cat > /etc/systemd/system/flask-admin.service << UNIT_EOF
@@ -873,7 +1030,7 @@ Resources:
               systemctl enable --now nginx
 
               echo "user-data finished OK"
-            - DomainName: !If [HasCustomDomain, !Sub "https://${DomainName}", "https://UPDATE_ME_WITH_CLOUDFRONT_DOMAIN"]
+            - AppUrl: !If [HasCustomDomain, !Sub "https://${DomainName}", !Sub "https://${CloudFrontDistribution.DomainName}"]
 
   AppAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -881,8 +1038,8 @@ Resources:
     Properties:
       AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
       VPCZoneIdentifier:
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetAId"
-        - Fn::ImportValue: !Sub "${VpcStackName}-${VpcName}-PrivateSubnetBId"
+        - !Ref AppSubnetA
+        - !Ref AppSubnetB
       LaunchTemplate:
         LaunchTemplateId: !Ref AppLaunchTemplate
         Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
@@ -956,12 +1113,12 @@ Resources:
       ComparisonOperator: LessThanThreshold
       AlarmActions: [!Ref ScaleInPolicy]
 
-  # ALB 5xx alarm — catches app errors and upstream failures.
+  # ALB 5xx alarm  -  catches app errors and upstream failures.
   AlbHttp5xxAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "${AWS::StackName}-alb-5xx"
-      AlarmDescription: ALB 5xx responses > 50 in 1 min — investigate app or instances
+      AlarmDescription: ALB 5xx responses > 50 in 1 min  -  investigate app or instances
       Namespace: AWS/ApplicationELB
       MetricName: HTTPCode_ELB_5XX_Count
       Dimensions:
@@ -974,12 +1131,12 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
-  # RDS CPU alarm — high CPU can signal query inefficiency or connection storms.
+  # RDS CPU alarm  -  high CPU can signal query inefficiency or connection storms.
   RdsCpuAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "${AWS::StackName}-rds-cpu-high"
-      AlarmDescription: RDS CPU > 80% for 5 min — review slow queries or scale up
+      AlarmDescription: RDS CPU > 80% for 5 min  -  review slow queries or scale up
       Namespace: AWS/RDS
       MetricName: CPUUtilization
       Dimensions:
@@ -991,12 +1148,12 @@ Resources:
       Threshold: 80
       ComparisonOperator: GreaterThanThreshold
 
-  # RDS storage alarm — triggers before the disk fills and the instance stalls.
+  # RDS storage alarm  -  triggers before the disk fills and the instance stalls.
   RdsFreeStorageAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "${AWS::StackName}-rds-low-storage"
-      AlarmDescription: RDS free storage < 2 GB — increase AllocatedStorage before it fills
+      AlarmDescription: RDS free storage < 2 GB  -  increase AllocatedStorage before it fills
       Namespace: AWS/RDS
       MetricName: FreeStorageSpace
       Dimensions:
@@ -1009,80 +1166,429 @@ Resources:
       Threshold: 2147483648
       ComparisonOperator: LessThanThreshold
 
+  # ===========================================================================
+  # EDGE RESOURCES (CloudFront + WAF + ACM + OAC + Route 53)
+  #
+  # These resources must run in us-east-1 when this template is deployed there.
+  # CloudFront distributions and WAF Web ACLs with scope=CLOUDFRONT are global
+  # services whose control plane lives in us-east-1. ACM certificates attached
+  # to CloudFront must also be in us-east-1.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # ACM Certificate  -  us-east-1, for CloudFront
+  #
+  # Teaching point  -  WHY must this be in us-east-1?
+  #   CloudFront is a global service whose control plane runs in us-east-1.
+  #   When you attach a cert to a CloudFront distribution, CloudFront needs to
+  #   access the private key at every edge location. AWS replicates the cert
+  #   from us-east-1 to all edge locations automatically, but ONLY for certs
+  #   that were issued in us-east-1. A cert issued in another region (e.g. your
+  #   ALB cert in eu-west-1) is invisible to CloudFront.
+  #
+  #   When deploying to us-east-1, the AlbCertificate and CloudFrontCertificate
+  #   cover the same domain in the same region. Both use DNS validation with
+  #   the same CNAME  -  you only need to add the CNAME once to your DNS provider.
+  # ---------------------------------------------------------------------------
+  CloudFrontCertificate:
+    Condition: HasCustomDomain
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-cf-cert"
+        - Key: Purpose
+          Value: CloudFront-us-east-1
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # WAF Web ACL  -  scope CLOUDFRONT, must be in us-east-1
+  #
+  # Rules:
+  #   1. AWS Common Rule Set   -  blocks SQLi, XSS, LFI, and other OWASP Top 10.
+  #   2. IP Reputation List    -  blocks known malicious IPs (scanners, bots).
+  #   3. RateLimit             -  blocks IPs making > 100 requests per 5 minutes.
+  # ---------------------------------------------------------------------------
+  WafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: logistics-prod-waf
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-waf"
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-common-rules"
+            SampledRequestsEnabled: true
+
+        - Name: AWS-AWSManagedRulesAmazonIpReputationList
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-ip-reputation"
+            SampledRequestsEnabled: true
+
+        - Name: RateLimit
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              AggregateKeyType: IP
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-rate-limit"
+            SampledRequestsEnabled: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-waf"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Origin Access Control (OAC)
+  #
+  # OAC replaces the older Origin Access Identity (OAI) for S3 origins.
+  # It signs requests from CloudFront to S3 with SigV4 so S3 can verify
+  # that the request came from your specific distribution.
+  # The S3 bucket blocks all public access; only requests with the correct
+  # OAC signature (matching the distribution ARN) are allowed.
+  # ---------------------------------------------------------------------------
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        Description: OAC for Logistics-Prod media bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket Policy  -  allow CloudFront to read via OAC
+  #
+  # Applied here (after CloudFrontDistribution) because the policy Condition
+  # requires the CloudFront distribution ARN. Both MediaBucket and
+  # CloudFrontDistribution are in the same template so no cross-stack import
+  # is needed  -  direct !Ref and !GetAtt resolve correctly.
+  # ---------------------------------------------------------------------------
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceArn": !Sub
+                  - "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistId}"
+                  - DistId: !Ref CloudFrontDistribution
+
+  # ---------------------------------------------------------------------------
+  # Custom cache policies
+  # ---------------------------------------------------------------------------
+
+  # /track/* cache policy: 60-second TTL, no cookies, no auth.
+  TrackCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-track-60s"
+        Comment: 60s TTL for public tracking pages
+        DefaultTTL: 60
+        MinTTL: 0
+        MaxTTL: 300
+        ParametersInCacheKeyAndForwardedToOrigin:
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Distribution
+  #
+  # Two origins:
+  #   alb-origin   -  the Application Load Balancer (dynamic content)
+  #   s3-origin    -  the S3 media bucket (photos and static assets)
+  #
+  # Five cache behaviors (evaluated in order of path specificity):
+  #   /admin/*   -> ALB, no cache, all headers + cookies forwarded
+  #   /driver/*  -> ALB, no cache, all headers + cookies forwarded
+  #   /track/*   -> ALB, 60s TTL, no cookies (public, cacheable)
+  #   /static/*  -> S3, long TTL (vendored CSS/JS)
+  #   /media/*   -> S3, long TTL (proof-of-delivery photos)
+  #   /*         -> ALB, no cache (default for dashboard, /, etc.)
+  #
+  # HTTP -> HTTPS redirect: viewer protocol policy is redirect-to-https on all
+  # behaviors. CloudFront enforces HTTPS; the ALB sees HTTP:80.
+  # ---------------------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: WafWebAcl
+    Properties:
+      DistributionConfig:
+        Comment: Logistics-Prod CDN
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+
+        # Custom domain alias (optional)
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref AWS::NoValue
+
+        # ACM cert (only attached when custom domain is provided)
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CloudFrontCertificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        # WAF Web ACL
+        WebACLId: !GetAtt WafWebAcl.Arn
+
+        Origins:
+          # --- ALB origin (dynamic Flask app) ---
+          - Id: alb-origin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+
+          # --- S3 origin (media bucket) ---
+          - Id: s3-origin
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""  # Empty because we use OAC, not OAI
+
+        # ---- Cache behaviors (checked before DefaultCacheBehavior) ----------
+        CacheBehaviors:
+
+          # /admin/*  -  Admins-only Flask-Admin GUI.
+          # Forward everything: cookies (session token), Authorization header.
+          # CachingDisabled: every request goes to origin, no CloudFront cache.
+          - PathPattern: /admin/*
+            TargetOriginId: alb-origin
+            ViewerProtocolPolicy: redirect-to-https
+            # CachingDisabled managed policy
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # AllViewer: forward all headers, cookies, query strings
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+            AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+            CachedMethods:  [GET, HEAD]
+
+          # /driver/*  -  Driver photo upload.
+          - PathPattern: /driver/*
+            TargetOriginId: alb-origin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+            AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+            CachedMethods:  [GET, HEAD]
+
+          # /track/*  -  Public shipment tracking. Cached for 60 seconds.
+          # No cookies forwarded (keeps cache keys clean for all visitors).
+          - PathPattern: /track/*
+            TargetOriginId: alb-origin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: !Ref TrackCachePolicy
+            # AllViewerExceptHostHeader: forward query strings but not cookies/auth
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            AllowedMethods: [GET, HEAD]
+            CachedMethods:  [GET, HEAD]
+
+          # /static/*  -  Vendored CSS/JS (Flask-Admin assets uploaded to S3).
+          # Long TTL: browser / CloudFront cache for up to 1 year.
+          - PathPattern: /static/*
+            TargetOriginId: s3-origin
+            ViewerProtocolPolicy: redirect-to-https
+            # CachingOptimized managed policy (long TTL, gzip/brotli enabled)
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            # CORS-S3Origin: adds Origin header so S3 returns CORS headers
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+            AllowedMethods: [GET, HEAD]
+            CachedMethods:  [GET, HEAD]
+
+          # /media/*  -  Proof-of-delivery photos stored in S3.
+          - PathPattern: /media/*
+            TargetOriginId: s3-origin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+            AllowedMethods: [GET, HEAD]
+            CachedMethods:  [GET, HEAD]
+
+        # ---- Default behavior (/*)  -  dashboard, auth, health, etc. ----------
+        DefaultCacheBehavior:
+          TargetOriginId: alb-origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+          CachedMethods:  [GET, HEAD]
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-distribution"
+        - Key: ManagedByCloudFormation
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # Route 53 A-alias record (optional)
+  #
+  # Creates logistics.example.com -> CloudFront distribution.
+  # Requires both DomainName and HostedZoneId to be set.
+  #
+  # Teaching note: Use an A record alias (not a CNAME) for the apex domain.
+  # CNAME at the apex is not valid DNS; Route 53 aliases resolve it correctly
+  # at the DNS level. For subdomains (logistics.example.com) both A-alias and
+  # CNAME work, but A-alias has no extra DNS lookup cost.
+  # ---------------------------------------------------------------------------
+  Route53Record:
+    Condition: HasHostedZone
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        # CloudFront's hosted zone ID is always Z2FDTNDATAQYW2 (AWS global constant).
+        HostedZoneId: Z2FDTNDATAQYW2
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        EvaluateTargetHealth: false
+
 # ============================================================================
 # OUTPUTS
 # ============================================================================
 Outputs:
 
+  PublicUrl:
+    Description: Public URL (custom domain if set, otherwise *.cloudfront.net)
+    Value: !If
+      - HasCustomDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  DistributionDomain:
+    Description: CloudFront default domain (https://*.cloudfront.net)
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  DistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidations)
+    Value: !Ref CloudFrontDistribution
+
   AlbDnsName:
-    Description: ALB DNS name (used as CloudFront ALB origin in 02-edge.yaml)
+    Description: ALB DNS name (direct HTTP access for internal testing)
     Value: !GetAtt ApplicationLoadBalancer.DNSName
-    Export:
-      Name: !Sub "${AWS::StackName}-AlbDnsName"
 
   AlbUrl:
-    Description: ALB direct URL (HTTP — for testing before CloudFront is set up)
+    Description: ALB direct URL (HTTP  -  for testing before CloudFront is ready)
     Value: !Sub "http://${ApplicationLoadBalancer.DNSName}/"
-    Export:
-      Name: !Sub "${AWS::StackName}-AlbUrl"
 
   MediaBucketName:
-    Description: S3 media bucket name (imported by 02-edge.yaml for OAC bucket policy)
+    Description: S3 media bucket name
     Value: !Ref MediaBucket
-    Export:
-      Name: !Sub "${AWS::StackName}-MediaBucketName"
-
-  MediaBucketArn:
-    Description: S3 media bucket ARN
-    Value: !GetAtt MediaBucket.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-MediaBucketArn"
 
   CognitoUserPoolId:
     Description: Cognito User Pool ID
     Value: !Ref CognitoUserPool
-    Export:
-      Name: !Sub "${AWS::StackName}-CognitoUserPoolId"
 
   CognitoClientId:
-    Description: Cognito app client ID (no secret — public client)
+    Description: Cognito app client ID (no secret  -  public client)
     Value: !Ref CognitoUserPoolClient
-    Export:
-      Name: !Sub "${AWS::StackName}-CognitoClientId"
 
   CognitoHostedUiDomain:
     Description: Cognito Hosted UI domain FQDN
     Value: !Sub "${CognitoDomainPrefix}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
-    Export:
-      Name: !Sub "${AWS::StackName}-CognitoHostedUiDomain"
 
   DbEndpoint:
     Description: RDS endpoint hostname
     Value: !GetAtt DBInstance.Endpoint.Address
-    Export:
-      Name: !Sub "${AWS::StackName}-DbEndpoint"
 
   SecretArn:
     Description: Secrets Manager secret ARN
     Value: !Ref DBSecret
-    Export:
-      Name: !Sub "${AWS::StackName}-SecretArn"
 
   AsgName:
     Description: Auto Scaling Group name
     Value: !Ref AppAutoScalingGroup
-    Export:
-      Name: !Sub "${AWS::StackName}-AsgName"
 
-  NextStep:
+  WafWebAclArn:
+    Description: WAF Web ACL ARN
+    Value: !GetAtt WafWebAcl.Arn
+
+  VpcId:
+    Description: VPC ID created by this stack
+    Value: !Ref Vpc
+
+  PublicSubnetAId:
+    Description: Public subnet AZ-a
+    Value: !Ref PublicSubnetA
+
+  PublicSubnetBId:
+    Description: Public subnet AZ-b
+    Value: !Ref PublicSubnetB
+
+  AppSubnetAId:
+    Description: App (private) subnet AZ-a
+    Value: !Ref AppSubnetA
+
+  AppSubnetBId:
+    Description: App (private) subnet AZ-b
+    Value: !Ref AppSubnetB
+
+  DbSubnetAId:
+    Description: DB (isolated) subnet AZ-a
+    Value: !Ref DbSubnetA
+
+  DbSubnetBId:
+    Description: DB (isolated) subnet AZ-b
+    Value: !Ref DbSubnetB
+
+  SchemaBootstrapCommand:
     Description: >
-      After stack reaches CREATE_COMPLETE:
-      1. Update the Cognito app client callback URLs with your CloudFront domain.
-      2. Deploy 02-edge.yaml.
-      3. Run schema bootstrap via SSM Run Command (see ssm-run-schema-from-artifact.sh).
+      SSM command to bootstrap the database schema after at least one instance is healthy.
+      ASG sets the Name tag to <stack>-asg on instances  -  use that tag value.
     Value: !Sub >
-      aws ssm send-command --region ${AWS::Region}
-      --document-name AWS-RunShellScript
-      --targets Key=tag:Name,Values=${AWS::StackName}-instance
-      --parameters commands=["cd /opt/app && psql -h ${DBInstance.Endpoint.Address}
-      -U appadmin -d logistics -f schema.sql"]
+      BACKEND_STACK=${AWS::StackName} APP_REGION=${AWS::Region}
+      ./scripts/ssm-run-schema-from-artifact.sh

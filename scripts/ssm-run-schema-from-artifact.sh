@@ -7,7 +7,7 @@
 # and the S3 artifact downloaded to /opt/app/).  No bastion required.
 #
 # Prerequisites:
-#   * 01-backend.yaml stack in CREATE_COMPLETE
+#   * cfn/template.yaml stack in CREATE_COMPLETE
 #   * At least one healthy ASG instance
 #   * Your terminal has AWS credentials with ssm:SendCommand permission
 #
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # ---- Configuration ----------------------------------------------------------
-BACKEND_STACK="${BACKEND_STACK:-logistics-prod-backend}"
+BACKEND_STACK="${BACKEND_STACK:-logistics-prod}"
 APP_REGION="${APP_REGION:-us-east-1}"
 SCHEMA_PATH="/opt/app/schema.sql"
 
@@ -48,7 +48,7 @@ echo "[INFO] Finding a registered SSM instance..."
 
 INSTANCE_ID=$(aws ssm describe-instance-information \
   --region "$APP_REGION" \
-  --filters "Key=tag:Name,Values=${BACKEND_STACK}-instance" \
+  --filters "Key=tag:Name,Values=${BACKEND_STACK}-asg" \
   --query "InstanceInformationList[?PingStatus=='Online'].InstanceId | [0]" \
   --output text 2>/dev/null || true)
 
