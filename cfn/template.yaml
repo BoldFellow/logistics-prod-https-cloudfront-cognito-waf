@@ -429,14 +429,15 @@ Resources:
       UserPoolId: !Ref CognitoUserPool
 
   # ---------------------------------------------------------------------------
-  # ACM Certificate (app region, for ALB HTTPS:443)
+  # ACM Certificate  -  single cert for both ALB HTTPS:443 and CloudFront
   #
-  # Teaching note: CloudFront requires its certificate in us-east-1.
-  # This certificate is for the ALB in the stack's deployment region.
-  # When deploying to us-east-1, CloudFront can reuse the same cert ARN for
-  # both the ALB listener and the CloudFront distribution.
+  # Teaching note: CloudFront requires its certificate in us-east-1. Because
+  # this merged template is locked to us-east-1, one cert covers both the ALB
+  # listener and the CloudFront distribution. One DNS validation CNAME is all
+  # that is needed.  (In a split-region setup you would need two separate certs:
+  # one in us-east-1 for CloudFront and one in the app region for the ALB.)
   # ---------------------------------------------------------------------------
-  AlbCertificate:
+  AcmCertificate:
     Condition: HasCustomDomain
     Type: AWS::CertificateManager::Certificate
     Properties:
@@ -444,7 +445,7 @@ Resources:
       ValidationMethod: DNS
       Tags:
         - Key: Name
-          Value: !Sub "${AWS::StackName}-alb-cert"
+          Value: !Sub "${AWS::StackName}-cert"
         - Key: ManagedByCloudFormation
           Value: "true"
 
@@ -886,7 +887,7 @@ Resources:
       Protocol: HTTPS
       Port: 443
       Certificates:
-        - CertificateArn: !Ref AlbCertificate
+        - CertificateArn: !Ref AcmCertificate
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
       DefaultActions:
         - Type: forward
@@ -1176,35 +1177,6 @@ Resources:
   # ===========================================================================
 
   # ---------------------------------------------------------------------------
-  # ACM Certificate  -  us-east-1, for CloudFront
-  #
-  # Teaching point  -  WHY must this be in us-east-1?
-  #   CloudFront is a global service whose control plane runs in us-east-1.
-  #   When you attach a cert to a CloudFront distribution, CloudFront needs to
-  #   access the private key at every edge location. AWS replicates the cert
-  #   from us-east-1 to all edge locations automatically, but ONLY for certs
-  #   that were issued in us-east-1. A cert issued in another region (e.g. your
-  #   ALB cert in eu-west-1) is invisible to CloudFront.
-  #
-  #   When deploying to us-east-1, the AlbCertificate and CloudFrontCertificate
-  #   cover the same domain in the same region. Both use DNS validation with
-  #   the same CNAME  -  you only need to add the CNAME once to your DNS provider.
-  # ---------------------------------------------------------------------------
-  CloudFrontCertificate:
-    Condition: HasCustomDomain
-    Type: AWS::CertificateManager::Certificate
-    Properties:
-      DomainName: !Ref DomainName
-      ValidationMethod: DNS
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-cf-cert"
-        - Key: Purpose
-          Value: CloudFront-us-east-1
-        - Key: ManagedByCloudFormation
-          Value: "true"
-
-  # ---------------------------------------------------------------------------
   # WAF Web ACL  -  scope CLOUDFRONT, must be in us-east-1
   #
   # Rules:
@@ -1376,7 +1348,7 @@ Resources:
         # ACM cert (only attached when custom domain is provided)
         ViewerCertificate: !If
           - HasCustomDomain
-          - AcmCertificateArn: !Ref CloudFrontCertificate
+          - AcmCertificateArn: !Ref AcmCertificate
             SslSupportMethod: sni-only
             MinimumProtocolVersion: TLSv1.2_2021
           - CloudFrontDefaultCertificate: true
