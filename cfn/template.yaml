@@ -443,6 +443,9 @@ Resources:
     Properties:
       DomainName: !Ref DomainName
       ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !If [HasHostedZone, !Ref HostedZoneId, !Ref "AWS::NoValue"]
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-cert"
