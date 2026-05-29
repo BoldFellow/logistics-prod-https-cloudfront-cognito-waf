@@ -41,20 +41,19 @@ If you don't have one, the app works fine on the `*.cloudfront.net` default URL.
 |---|---|---|---|
 | 0 | — | Prerequisites | Upload app.zip to artifact bucket |
 | 1 | VPC | VPC + subnets + IGW + route tables + NAT | Self-contained network — 2 public, 2 app (private), 2 DB (isolated) |
-| 2 | S3 | Media bucket (private) | No bucket policy yet — applied in §11 once CloudFront ARN is known |
+| 2 | S3 | Media bucket (private) | No bucket policy yet — applied in §10 once CloudFront ARN is known |
 | 3 | RDS | Multi-AZ PostgreSQL + DB subnet group | 7-day backups; master password typed manually |
 | 4 | Secrets Manager | RDS secret + `flask_secret_key` + rotation | Full config in one shot — RDS exists so instance can be selected and rotation enabled |
-| 5 | Cognito | User Pool + Hosted UI | Groups: Admins, Drivers — callback URL set in §11 after CloudFront domain is known |
-| 6 | ACM | Cert in **us-east-1** | For CloudFront — requested early so DNS validation runs in parallel |
-| 7 | ACM | Cert in **app region** | For ALB HTTPS:443 — skip if app region is us-east-1 |
-| 8 | EC2 | ALB + target group + HTTP/HTTPS listeners | CloudFront origin — target group can be empty at creation |
-| 9 | IAM | Instance role + instance profile | Needed by Launch Template in §13 |
-| 10 | WAF | Web ACL (CLOUDFRONT scope, us-east-1) | Attached when CloudFront is created in §12 |
-| 11 | CloudFront | Distribution + OAC + S3 bucket policy + Cognito callback | All final-URL wiring in one block |
-| 12 | EC2 | Launch Template + ASG | userdata uses real `APP_URL` from §11 — no instance refresh needed |
-| 13 | SSM | Schema bootstrap | Run schema.sql via Run Command once instances are healthy |
-| 14 | Route 53 | A-alias record | Optional — custom domain only |
-| 15 | — | End-to-end smoke test | Single pass through CloudFront |
+| 5 | Cognito | User Pool + Hosted UI | Groups: Admins, Drivers — callback URL set in §10 after CloudFront domain is known |
+| 6 | ACM | Single cert in **us-east-1** | Serves both CloudFront and ALB HTTPS:443 — one DNS validation CNAME |
+| 7 | EC2 | ALB + target group + HTTP/HTTPS listeners | CloudFront origin — target group can be empty at creation |
+| 8 | IAM | Instance role + instance profile | Needed by Launch Template in §11 |
+| 9 | WAF | Web ACL (CLOUDFRONT scope, us-east-1) | Attached when CloudFront is created in §10 |
+| 10 | CloudFront | Distribution + OAC + S3 bucket policy + Cognito callback | All final-URL wiring in one block |
+| 11 | EC2 | Launch Template + ASG | userdata uses real `APP_URL` from §10 — no instance refresh needed |
+| 12 | SSM | Schema bootstrap | Run schema.sql via Run Command once instances are healthy |
+| 13 | Route 53 | A-alias record | Optional — custom domain only |
+| 14 | — | End-to-end smoke test | Single pass through CloudFront |
 
 ---
 
@@ -180,7 +179,7 @@ After creating: select each **public** subnet → **Actions** → **Edit subnet 
 6. Click **Create bucket**
 
 > The bucket is empty now.  Drivers upload photos via the Flask app.
-> The bucket policy (allowing CloudFront via OAC) is applied in §11 once the
+> The bucket policy (allowing CloudFront via OAC) is applied in §10 once the
 > CloudFront distribution ARN is known.
 > Static assets (Flask-Admin CSS/JS) can be uploaded to `s3://bucket/static/`.
 
@@ -307,7 +306,7 @@ correctly), and rotation enabled — all without leaving this section.
 
 ### Step 4b — Note the Secret ARN
 
-Copy the ARN — you'll need it for the IAM role in §9.
+Copy the ARN — you'll need it for the IAM role in §8.
 
 > Teaching note: Secrets Manager eliminates hardcoded passwords.
 > The EC2 instance role grants `secretsmanager:GetSecretValue` on this one
@@ -339,7 +338,7 @@ Copy the ARN — you'll need it for the IAM role in §9.
    - User pool name: `logistics-prod-users`
    - Hosted UI: **do not enable Hosted UI here** — skip the "Use the Cognito Hosted UI"
      toggle entirely. The OAuth callback URL can only be set once the CloudFront domain
-     is known. You will enable Hosted UI and configure the callback in §11d.
+     is known. You will enable Hosted UI and configure the callback in §10d.
    - App type: **Public client**
    - App client name: `logistics-prod-web-client`
    - Client secret: **Don't generate** (public client — no secret)
@@ -347,8 +346,8 @@ Copy the ARN — you'll need it for the IAM role in §9.
 
 > **Why defer Hosted UI?** The Authorization Code Grant flow requires an exact-match
 > callback URL registered in Cognito — `https://<CF_DOMAIN>/auth/callback`. That domain
-> is only known after CloudFront is deployed in §11. Configuring it now would require a
-> placeholder URL that silently mismatches and causes login loops. Instead, §11d sets up
+> is only known after CloudFront is deployed in §10. Configuring it now would require a
+> placeholder URL that silently mismatches and causes login loops. Instead, §10d sets up
 > Hosted UI and OAuth immediately after the CloudFront domain is available.
 
 **After the pool is created — set the Cognito domain:**
@@ -359,7 +358,7 @@ Copy the ARN — you'll need it for the IAM role in §9.
   > The full domain becomes: `logistics-prod-auth-<AccountId>.auth.<Region>.amazoncognito.com`
 - Click **Create Cognito domain**
 
-Note the full domain — you'll paste it into the userdata in §12.
+Note the full domain — you'll paste it into the userdata in §11.
 
 ### Step 5b — Create user groups
 
@@ -387,80 +386,55 @@ Create two groups:
 
 ---
 
-## 6. ACM Certificate — us-east-1 (for CloudFront)
-
-> **Console:** Switch region to **US East (N. Virginia)** → Certificate Manager → **Request a certificate**
-
-**CloudFormation:** `CloudFrontCertificate` (in cfn/template.yaml, conditional)
-
-> **This is the most important regional constraint in this project.**
-> Request this certificate first so DNS validation runs in parallel while you
-> complete §7–§10.
-
-### Why must this certificate be in us-east-1?
-
-CloudFront is a global service, but its control plane lives in `us-east-1`.
-When you attach an ACM certificate to a CloudFront distribution, CloudFront
-replicates the certificate's private key to every edge location worldwide.
-This replication only works for certificates issued in `us-east-1`.
-
-A certificate issued in `eu-west-1` (for example) is invisible to CloudFront
-even if it covers the same domain.  CloudFront simply won't offer it in the
-certificate dropdown.
-
-> **Skip this section if you don't have a custom domain.**
-> CloudFront will use its default `*.cloudfront.net` TLS certificate at no cost.
-
-1. **While in us-east-1**, request a public certificate for `logistics.example.com`
-2. Validation method: **DNS validation**
-3. Click **Request**
-4. Expand the certificate → click **Create records in Route 53**
-   (or copy the CNAME and add it manually to your DNS provider)
-5. DNS validation takes ~5 minutes. You don't need to wait — continue to §7.
-   CloudFront will only need this cert to be **Issued** by the time you create
-   the distribution in §11.
-6. Copy the **Certificate ARN** for use in §11.
-
-> **Exception — when app region IS us-east-1:** Both ALB and CloudFront are in
-> us-east-1, so ACM will deduplicate the certificate request. You can use the same
-> ARN for both the ALB listener in §8 and for CloudFront in §11 — no second cert
-> needed. If you request a second cert for the same domain in the same region, ACM
-> returns the existing one (not a duplicate).
-
----
-
-## 7. ACM Certificate — App Region (for ALB)
+## 6. ACM Certificate (single cert for ALB + CloudFront)
 
 > **Console:** Certificate Manager → **Request a certificate**
 
-**CloudFormation:** `AlbCertificate` (conditional on `DomainName` parameter)
+**CloudFormation:** `AcmCertificate` (in cfn/template.yaml, conditional on `DomainName`)
 
 > **Skip this section if you don't have a custom domain.**
-> The ALB works on HTTP:80. CloudFront enforces HTTPS for public users.
->
-> **Skip this section if your app region is us-east-1** — use the cert ARN from §6
-> for the ALB HTTPS listener. Both certificates cover the same domain, and ACM
-> deduplicates them in the same region.
+> CloudFront uses its default `*.cloudfront.net` TLS certificate at no cost, and the
+> ALB operates on HTTP:80 (CloudFront enforces HTTPS for public users).
 
-1. Certificate type: **Request a public certificate**
-2. Fully qualified domain name: `logistics.example.com` (your domain)
-3. Validation method: **DNS validation**
-4. Click **Request**
-5. Expand the certificate → click **Create records in Route 53**
-   (or copy the CNAME — it is the same CNAME as §6, already added, so validation
-   is instant)
-6. Wait for status to change from **Pending validation** to **Issued** (~5 minutes)
-7. Copy the **Certificate ARN** — you'll need it for the ALB HTTPS listener in §8
+Because this stack is locked to us-east-1 and CloudFront's certificate must also be in
+us-east-1, **one certificate serves both the ALB HTTPS listener and the CloudFront
+distribution**. You only need to add one DNS validation CNAME.
+
+### Why must the CloudFront certificate be in us-east-1?
+
+CloudFront is a global service whose control plane lives in `us-east-1`. When you attach
+an ACM certificate to a CloudFront distribution, CloudFront replicates the private key
+to every edge location — but only for certificates issued in `us-east-1`. A certificate
+from any other region is invisible to CloudFront's certificate dropdown.
+
+> **Note for split-region deployments:** If you ever need the backend in a non-us-east-1
+> region, you would need two certificates: one in us-east-1 for CloudFront, and a second
+> in the app region for the ALB. The original two-stack layout handles this case and is
+> preserved in git history.
+
+### Request the certificate
+
+1. Ensure you are in region **US East (N. Virginia) — us-east-1**
+2. Certificate Manager → **Request a certificate** → **Request a public certificate**
+3. Fully qualified domain name: `logistics.example.com` (your domain)
+4. Validation method: **DNS validation**
+5. Click **Request**
+6. Expand the certificate → click **Create records in Route 53**
+   (or copy the CNAME and add it to your DNS provider)
+7. DNS validation takes ~5 minutes. You don't need to wait — continue to §7.
+   The cert only needs to be **Issued** by the time you create the distribution in §10.
+8. Copy the **Certificate ARN** — you will use the same ARN for both the ALB HTTPS
+   listener (§7) and the CloudFront distribution (§10).
 
 ---
 
-## 8. ALB with HTTPS Listener
+## 7. ALB with HTTPS Listener
 
 > **Console:** EC2 → **Load Balancers** → **Create load balancer** → **Application Load Balancer**
 
 **CloudFormation:** `ApplicationLoadBalancer`, `TargetGroup`, `HttpListener`, `HttpsListener`
 
-### Step 8a — Create the ALB
+### Step 7a — Create the ALB
 
 1. Name: `logistics-prod-alb`
 2. Scheme: **Internet-facing**
@@ -470,7 +444,7 @@ certificate dropdown.
    - Inbound port 80 from `0.0.0.0/0` (CloudFront uses this)
    - Inbound port 443 from `0.0.0.0/0` (direct HTTPS access)
 
-### Step 8b — Create the target group
+### Step 7b — Create the target group
 
 1. Target type: **Instances**
 2. Name: `logistics-prod-tg`
@@ -479,11 +453,11 @@ certificate dropdown.
 5. Interval: 15 seconds
 6. Healthy threshold: 2, Unhealthy threshold: 3
 
-> The target group is empty at this point — the ASG instances are created in §12,
+> The target group is empty at this point — the ASG instances are created in §11,
 > after CloudFront is set up. CloudFront accepts an ALB origin whose target group
 > has zero healthy instances at creation time.
 
-### Step 8c — Listeners
+### Step 7c — Listeners
 
 **HTTP:80 listener** (forward — CloudFront uses this):
 - Protocol: HTTP, Port: 80
@@ -497,17 +471,17 @@ certificate dropdown.
 > CloudFront (which is correct), CloudFront would then try HTTP:80 on the ALB
 > again — and get another redirect.  This creates an infinite loop.
 > The HTTP→HTTPS enforcement happens at the **CloudFront viewer protocol policy**
-> (§11), not at the ALB.
+> (§10), not at the ALB.
 
-**HTTPS:443 listener** (skip if you don't have an ACM cert from §7):
+**HTTPS:443 listener** (skip if you don't have an ACM cert from §6):
 - Protocol: HTTPS, Port: 443
-- Certificate: select the cert you created in §7 (app region cert; or §6 if app region is us-east-1)
+- Certificate: select the cert you created in §6 (app region cert; or §6 if app region is us-east-1)
 - Security policy: **ELBSecurityPolicy-TLS13-1-2-2021-06**
 - Default action: **Forward** to `logistics-prod-tg`
 
 ---
 
-## 9. IAM Instance Role
+## 8. IAM Instance Role
 
 > **Console:** IAM → **Roles** → **Create role**
 
@@ -549,7 +523,7 @@ certificate dropdown.
 
 ---
 
-## 10. WAF Web ACL
+## 9. WAF Web ACL
 
 > **Console:** Switch to region **us-east-1** → WAF & Shield → **Create web ACL**
 
@@ -571,18 +545,18 @@ certificate dropdown.
    - Action: **Block**
 5. Default action: **Allow**
 6. Click **Create web ACL** — do NOT associate with any resource yet (you'll
-   attach it to CloudFront in §11)
+   attach it to CloudFront in §10)
 
 ---
 
-## 11. CloudFront Distribution
+## 10. CloudFront Distribution
 
 > **Console:** CloudFront → **Create a CloudFront distribution**
 
 **CloudFormation:** `CloudFrontDistribution`, `OriginAccessControl`,
 `MediaBucketPolicy` (in cfn/template.yaml)
 
-### Step 11a — Origin Access Control (for S3)
+### Step 10a — Origin Access Control (for S3)
 
 > CloudFront → **Origin access** → **Create control setting**
 
@@ -591,7 +565,7 @@ certificate dropdown.
 3. Origin type: **S3**
 4. Click **Create**
 
-### Step 11b — Create the distribution
+### Step 10b — Create the distribution
 
 **ALB Origin:**
 1. Origin domain: `logistics-prod-alb-xxxxxxx.us-east-1.elb.amazonaws.com`
@@ -626,7 +600,7 @@ MaxTTL=300, no cookies, no headers in the cache key.
 
 **Settings:**
 - Price class: **Use only North America and Europe** (demo — cheaper)
-- WAF: select `logistics-prod-waf` (created in §10)
+- WAF: select `logistics-prod-waf` (created in §9)
 - Custom domain (if you have one): add `logistics.example.com`
 - Custom certificate (if domain set): select the us-east-1 ACM cert from §6
 - Default root object: leave blank (Flask handles `/`)
@@ -635,9 +609,9 @@ MaxTTL=300, no cookies, no headers in the cache key.
 Click **Create distribution** — takes **10–15 minutes** to deploy globally.
 
 **Note the CloudFront domain** (e.g. `xxxx.cloudfront.net`) from the distribution
-detail page — you'll use it in §11c, §11d, and §12.
+detail page — you'll use it in §7c, §10d, and §11.
 
-### Step 11c — Add S3 bucket policy for OAC
+### Step 10c — Add S3 bucket policy for OAC
 
 After the distribution is created, the CloudFront console shows a banner:
 "You must update the S3 bucket policy to allow CloudFront to access it."
@@ -670,9 +644,9 @@ Paste the copied policy.  It looks like:
 > **Teaching point — OAC vs. making the bucket public:**
 > The `aws:SourceArn` condition ensures that ONLY this specific CloudFront
 > distribution can read the bucket.  Even someone who knows the S3 URL cannot
-> access the photos directly — they get a 403 (verified in smoke test §15).
+> access the photos directly — they get a 403 (verified in smoke test §14).
 
-### Step 11d — Enable Hosted UI and set Cognito callback URLs
+### Step 10d — Enable Hosted UI and set Cognito callback URLs
 
 > **CloudFormation note:** If you deployed via `cfn/template.yaml`, the callback and logout URLs are wired automatically at deploy time — `CognitoUserPoolClient` references `CloudFrontDistribution.DomainName` directly. You can skip this step for CFN deployments and verify with `aws cognito-idp describe-user-pool-client ...` that the URLs already contain your CloudFront domain.
 
@@ -694,7 +668,7 @@ no placeholder was ever registered.
 
 ---
 
-## 12. Launch Template + Auto Scaling Group
+## 11. Launch Template + Auto Scaling Group
 
 > **Console:** EC2 → **Launch Templates** → **Create launch template**
 
@@ -702,20 +676,20 @@ no placeholder was ever registered.
 
 > **Before starting:** collect the following values from earlier sections —
 > you will paste them directly into the userdata below:
-> - CloudFront domain from §11b (e.g. `xxxx.cloudfront.net`)
+> - CloudFront domain from §10b (e.g. `xxxx.cloudfront.net`)
 > - Cognito User Pool ID from §5a
 > - Cognito App Client ID from §5a
 > - Cognito Hosted Domain from §5a (e.g. `logistics-prod-auth-ACCOUNT.auth.REGION.amazoncognito.com`)
 > - Media bucket name from §2 (S3 Media Bucket)
 
-### Step 12a — Launch Template
+### Step 11a — Launch Template
 
 1. Name: `logistics-prod-lt`
 2. AMI: use the SSM-resolved path for Amazon Linux 2023 ARM64:
    `{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}`
    Or search for `al2023-ami-kernel-default-arm64` in AMI catalog
 3. Instance type: `t4g.small`
-4. IAM instance profile: `logistics-prod-app-role` (created in §9)
+4. IAM instance profile: `logistics-prod-app-role` (created in §8)
 5. Security group: `logistics-prod-app-sg` (allows inbound 80 from ALB SG)
 6. Metadata options: IMDSv2 **Required**
 7. User data: paste the script below, replacing placeholders with the values
@@ -735,7 +709,7 @@ COGNITO_POOL_ID="YOUR_USER_POOL_ID"
 COGNITO_CLIENT="YOUR_CLIENT_ID"
 COGNITO_HOSTED_DOMAIN="YOUR_PREFIX-YOUR_ACCOUNT_ID.auth.YOUR_REGION.amazoncognito.com"
 MEDIA_BUCKET="logistics-prod-media-YOUR_ACCOUNT_ID"
-APP_URL="https://YOUR_CLOUDFRONT_DOMAIN"   # From §11b — e.g. https://xxxx.cloudfront.net
+APP_URL="https://YOUR_CLOUDFRONT_DOMAIN"   # From §10b — e.g. https://xxxx.cloudfront.net
 
 # Base packages
 dnf update -y
@@ -808,7 +782,7 @@ systemctl enable --now flask-admin nginx
 echo "user-data OK"
 ```
 
-### Step 12b — Auto Scaling Group
+### Step 11b — Auto Scaling Group
 
 > EC2 → **Auto Scaling Groups** → **Create Auto Scaling group**
 
@@ -825,7 +799,7 @@ echo "user-data OK"
 
 ---
 
-## 13. Schema Bootstrap via SSM Run Command
+## 12. Schema Bootstrap via SSM Run Command
 
 **Wait until at least one ASG instance shows "healthy" in the target group.**
 
@@ -876,7 +850,7 @@ Verify: visit `http://<ALB-DNS>/dashboard` — you should see 10 customers,
 
 ---
 
-## 14. Route 53 Alias (Optional)
+## 13. Route 53 Alias (Optional)
 
 > **Console:** Route 53 → **Hosted zones** → select your zone → **Create record**
 
@@ -893,7 +867,7 @@ Verify: visit `http://<ALB-DNS>/dashboard` — you should see 10 customers,
 
 ---
 
-## 15. End-to-End Smoke Test
+## 14. End-to-End Smoke Test
 
 Wait for all resources to be healthy before testing:
 - ALB target group: all instances `healthy`
@@ -943,7 +917,7 @@ open "https://$CF_DOMAIN/admin/"
 
 ---
 
-## 16. Cleanup
+## 15. Cleanup
 
 **Order matters** — CloudFront must be disabled before deletion, and the
 distribution takes ~15 minutes to disable globally.
@@ -988,7 +962,7 @@ aws cloudformation wait stack-delete-complete --stack-name logistics-prod --regi
 
 ---
 
-## 17. Troubleshooting
+## 16. Troubleshooting
 
 ### Cert region mismatch (CloudFront shows "No certificate available")
 
@@ -999,7 +973,7 @@ is empty or your cert doesn't appear.
 cert to be in `us-east-1`.
 
 **Fix:** Go to `us-east-1` → Certificate Manager → request the cert again.
-Validate with the same CNAME (already in DNS from §6 or §7 — it validates instantly).
+Validate with the same CNAME (already in DNS from §6 or §10 — it validates instantly).
 
 ---
 
@@ -1025,7 +999,7 @@ Validate with the same CNAME (already in DNS from §6 or §7 — it validates in
    Update DB records: `UPDATE shipments SET proof_photo_key = 'media/' || proof_photo_key WHERE proof_photo_key NOT LIKE 'media/%';`
 
 2. **Bucket policy not applied** — Go to S3 → bucket → Permissions → Bucket policy.
-   If empty, paste the policy from §11c.
+   If empty, paste the policy from §10c.
 
 3. **Wrong S3 origin format** — The S3 origin domain must be in path-style format:
    `bucket-name.s3.region.amazonaws.com`
@@ -1296,7 +1270,7 @@ aws cognito-idp describe-user-pool-client \
 
 ### Step C3 — Bootstrap the database schema
 
-Once at least one ASG instance is healthy, run the schema bootstrap via SSM (same as §13):
+Once at least one ASG instance is healthy, run the schema bootstrap via SSM (same as §12):
 
 ```bash
 BACKEND_STACK=logistics-prod APP_REGION="$APP_REGION" \

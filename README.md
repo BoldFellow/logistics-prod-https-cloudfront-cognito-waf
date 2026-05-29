@@ -54,7 +54,7 @@ Two CloudFormation stacks (regional split required for CloudFront):
    ```
 5. **Post-deploy wiring** — update the Cognito callback URL and S3 bucket policy with the CloudFront domain (see guide.md §10)
 
-See [guide.md](guide.md) for the full console walkthrough of all 14 sections.
+See [guide.md](guide.md) for the full console walkthrough of all 17 sections.
 
 ## What you'll destroy at cleanup
 
@@ -79,7 +79,7 @@ aws cloudformation delete-stack --stack-name logistics-prod-backend
 | `architecture.drawio` | Architecture source (export to `architecture.png` with draw.io) |
 | `cfn/01-backend.yaml` | CloudFormation — backend stack (Cognito, RDS, ALB, ASG, Secrets Manager) |
 | `cfn/02-edge.yaml` | CloudFormation — edge stack (ACM, WAF, CloudFront, Route 53) |
-| `guide.md` | Full console walkthrough — 14 sections |
+| `guide.md` | Full console walkthrough — 17 sections |
 | `app/app.py` | Flask application with Cognito JWT validation |
 | `app/schema.sql` | PostgreSQL schema — shipments + drivers |
 | `app/requirements.txt` | Python dependencies |
